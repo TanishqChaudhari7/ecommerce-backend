@@ -45,6 +45,26 @@
 
 ## [Step 3] - Auth & RBAC
 
+- Added dependencies: `jsonwebtoken`, `zod`, `helmet`, `cors`, `ioredis`, `ms`, `swagger-jsdoc`, `swagger-ui-express` (+ types).
+- Added `src/utils/AppError.ts` — a minimal `Error` subclass carrying a `statusCode`, used by services and middleware to drive the existing global `errorHandler`.
+- Added `src/config/redis.ts` — a shared `ioredis` client reading `REDIS_URL` from `config/env.ts`.
+- Added `src/types/express.d.ts` — global augmentation adding a typed `req.user?: AccessTokenPayload` to Express's `Request`.
+- Rebuilt the `auth` module (replacing the Step 1 placeholder):
+  - `POST /api/v1/auth/register` — bcrypt-hashes the password (12 rounds), inserts the user with the role from the request body (defaulting to `customer`), returns the created user with `password_hash` excluded. Returns `409` on duplicate email.
+  - `POST /api/v1/auth/login` — verifies credentials, issues a 15-minute JWT access token (`{ userId, email, role }`) and a 7-day opaque refresh token, storing the refresh token + `expires_at` in the `sessions` table.
+  - `POST /api/v1/auth/refresh` — looks up the refresh token in `sessions`, checks `expires_at`, deletes the old session, and issues a brand new access/refresh pair (rotation).
+  - `POST /api/v1/auth/logout` — deletes the session row matching the given refresh token.
+  - `GET /api/v1/auth/me` — protected by `authenticateToken`, returns the current user freshly read from the database.
+- Added `src/middleware/authenticateToken.ts` — verifies the `Authorization: Bearer <token>` JWT and attaches the payload to `req.user`; responds `401` on missing/invalid/expired tokens.
+- Added `src/middleware/requireRole.ts` — `requireRole(...roles)` factory; responds `403` if `req.user` is missing or its role isn't in the allowed list. Verified directly against mock requests (allow/deny for each role combination).
+- Added `src/middleware/rateLimiter.ts` — Redis sorted-set sliding-window limiter (`ZREMRANGEBYSCORE` prune → `ZCARD` check → `ZADD` record), returning `429` with a `Retry-After` header (seconds until the oldest entry ages out of the window) when exceeded. Applied to `/register` (10/hour/IP) and `/login` (5/15min/IP).
+- Added `src/middleware/validate.ts` — generic `validateBody(schema)` middleware running any Zod schema against `req.body`, returning `400` with flattened field errors on failure.
+- Added `src/modules/auth/auth.validation.ts` — Zod schemas for register/login/refresh/logout bodies.
+- Added `helmet()` and `cors()` globally in `src/app.ts` (mounted before body parsing/routes).
+- Added Swagger documentation: `src/config/swagger.ts` builds an OpenAPI 3.0 spec via `swagger-jsdoc` from `@openapi` JSDoc blocks on each route (glob picks `.ts` in dev / `.js` in the compiled build automatically); mounted at `GET /api-docs` via `swagger-ui-express`. All 5 auth endpoints documented.
+- Added `tests/setup.ts` (wired via `jest.config.js`'s `setupFilesAfterEnv`) to close the shared `pg.Pool` and `ioredis` connections after each test file, so `npm test` exits cleanly instead of leaving open handles.
+- Verified end-to-end against the running local PostgreSQL + Redis instances: register (incl. duplicate-email 409 and Zod validation 400), login, `/me` with valid/missing/garbage tokens, refresh rotation (old token rejected after use), logout (token rejected after logout), wrong-password 401, login rate limit tripping at the 6th request in 15 minutes with a correct `Retry-After`, register rate limit tripping at the 11th request in an hour, and the Swagger UI/spec serving all 5 documented paths.
+
 ## [Step 4] - Products, Inventory & Search
 
 ## [Step 5] - Cart, Orders, Payments & Kafka

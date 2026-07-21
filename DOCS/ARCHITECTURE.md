@@ -136,3 +136,81 @@ Each module folder is self-contained and has no imports from sibling modules —
 | Customer | `customer@test.com` | `Test@1234` |
 
 All three share the same bcrypt hash of `Test@1234` (cost factor 10). `npm run seed` is safe to run repeatedly (every insert targets the row's natural unique key with `ON CONFLICT ... DO NOTHING`); `npm run seed:fresh` truncates all 10 tables (`CASCADE`) and reseeds from scratch. Every seeded row uses a deterministic, hardcoded UUID (grouped by table, e.g. all user ids start `00000001-...`) rather than `gen_random_uuid()`, which is what makes reruns idempotent instead of merely conflict-free.
+
+## Step 3 - Auth & RBAC
+
+### Access vs. refresh token strategy
+
+Two tokens with very different shapes, on purpose:
+
+- **Access token** — a signed JWT (`jsonwebtoken`, `HS256` via `env.jwtSecret`) carrying `{ userId, email, role }`, expiring after 15 minutes (`JWT_EXPIRES_IN`). It's stateless: `authenticateToken` only has to verify the signature and expiry, with no database round-trip, which is what makes it cheap to check on every request.
+- **Refresh token** — an opaque random string (`crypto.randomBytes(64).toString('hex')`, *not* a JWT), stored server-side in `sessions` (`user_id`, `refresh_token`, `expires_at`), expiring after 7 days (`JWT_REFRESH_EXPIRES_IN`). Because it's just a row in the database, it can be revoked instantly (delete the row) — something a stateless JWT refresh token could not do without an extra denylist.
+
+The short-lived stateless token keeps the hot path (every authenticated request) fast and DB-free; the long-lived stateful token keeps the sensitive, infrequent path (getting a new access token) revocable. Neither token alone gives both properties — that's the reason for two.
+
+### Token rotation flow
+
+`POST /api/v1/auth/refresh` with `{ refreshToken }`:
+
+1. Look up `sessions WHERE refresh_token = $1`. Not found → `401 Invalid refresh token`.
+2. Check `session.expires_at` against `now()`. Expired → delete the row anyway (cleanup) and return `401 Refresh token expired`.
+3. Load the owning user. Missing or `is_active = false` → delete the session and return `401 User no longer active`.
+4. **Delete the old session row unconditionally** before issuing anything new — this is the "rotate" step: the old refresh token becomes unusable the instant it's used, whether or not the request as a whole succeeds past this point.
+5. Issue a brand new access token + a brand new opaque refresh token, insert the new session row, return both to the client.
+
+Practical effect: a refresh token is single-use. If it's ever replayed (e.g. stolen and used by an attacker after the legitimate client already rotated it), the second use simply 401s because the row is already gone — the same mechanism that enables rotation also limits the blast radius of a leaked refresh token to a single use.
+
+### RBAC middleware chain
+
+Two independent, composable middlewares, applied in sequence on a route:
+
+```
+router.get('/some-protected-route', authenticateToken, requireRole('seller', 'admin'), controller.handler);
+```
+
+- **`authenticateToken`**: reads `Authorization: Bearer <token>`, `jwt.verify`s it against `env.jwtSecret`, and on success attaches the decoded payload to `req.user` (typed as `AccessTokenPayload`). Missing header, malformed token, bad signature, or expiry all produce the same `401` — the client can't distinguish "no token" from "bad token" from "expired token," which avoids leaking which case applies.
+- **`requireRole(...roles)`**: a factory, not a middleware itself — calling it with a list of allowed roles (e.g. `requireRole('admin')`) returns a middleware that checks `req.user.role` against that list, responding `403` if `req.user` is missing (i.e. `authenticateToken` wasn't run first, or somehow didn't attach a user) or its role isn't allowed.
+
+Splitting these two concerns (authentication vs. authorization) means a route can require login without restricting role (`authenticateToken` alone, as `GET /me` does), or chain both when only specific roles should reach a handler. No route in Step 3 uses `requireRole` yet — the endpoints seeded here (register/login/refresh/logout/me) are either public or "any authenticated user"; role-gated business endpoints (e.g. only sellers creating products) are wired starting Step 4, reusing this same middleware unchanged.
+
+### Redis sliding-window rate limiting
+
+`src/middleware/rateLimiter.ts` implements a true sliding window (not fixed-window buckets) using one Redis **sorted set** per `(route, IP)`, where each member's score is the request's timestamp in milliseconds:
+
+1. `ZREMRANGEBYSCORE key 0 (now - windowMs)` — prune every entry older than the window; this is what makes it "sliding" rather than resetting on a clock boundary.
+2. `ZCARD key` — count what's left (i.e. requests within the last `windowMs`).
+3. If `count >= max`: read the oldest surviving entry (`ZRANGE key 0 0 WITHSCORES`) to compute exactly when it will age out (`oldestTimestamp + windowMs - now`), set that as the `Retry-After` header (in seconds), and respond `429`.
+4. Otherwise: `ZADD key now <unique-member>` to record this request, `PEXPIRE key windowMs` so an abandoned key cleans itself up, and call `next()`.
+
+The member string (`${now}-${random}`) is unique per request even when two requests land in the same millisecond, since sorted set members must be unique — using a bare timestamp as the member would silently collide and undercount. Applied via `rateLimit({ windowMs, max, keyPrefix })`:
+
+- `login`: 5 requests / 15 minutes / IP.
+- `register`: 10 requests / hour / IP.
+
+Both limiters count *every* request that reaches the route (successes, wrong-password 401s, and validation 400s alike), because the limiter middleware runs before Zod validation — rate limiting only the "invalid" requests would let an attacker bypass it by sending malformed bodies.
+
+### Security decisions
+
+- **bcrypt cost factor 12** for password hashing — higher than the library default (10) to raise the cost of offline brute-forcing if the `users` table were ever exfiltrated, while still completing in well under 100ms on typical hardware.
+- **Access tokens are short-lived (15 min)** specifically so that a leaked access token has a small, fixed window of usefulness, without requiring any server-side revocation mechanism for them.
+- **Refresh tokens are opaque, not JWTs** — see "Access vs. refresh token strategy" above; this is what makes instant revocation (logout, rotation) possible.
+- **Registration accepts `role` directly from the request body** (defaulting to `customer`) as specified — meaning any caller can currently self-register as `seller` or even `admin`. This is a known, deliberate simplification for this stage of the project (there's no invite/approval flow yet); it should be revisited before this API is exposed publicly (e.g. requiring an existing admin to grant the `seller`/`admin` role instead of trusting client input).
+- **`helmet()`** is applied globally and first in the middleware chain, adding the standard protective headers (`Content-Security-Policy`, `X-Content-Type-Options: nosniff`, `X-Frame-Options`, `Strict-Transport-Security`, etc.) to every response, auth-related or not.
+- **`cors()`** is applied with its permissive defaults (reflects any origin) — appropriate for this stage of development; will need an explicit allow-list once there's a known frontend origin to restrict to.
+- **Generic auth error messages**: login failures always say "Invalid email or password" regardless of whether the email exists, and `authenticateToken` always says "Invalid or expired access token" regardless of which check failed — both deliberately avoid confirming to an attacker which half of a guess was correct.
+
+### `req.user` typing
+
+`src/types/express.d.ts` uses TypeScript's global augmentation to add `user?: AccessTokenPayload` to Express's own `Request` interface:
+
+```ts
+declare global {
+  namespace Express {
+    interface Request {
+      user?: AccessTokenPayload;
+    }
+  }
+}
+```
+
+Because this merges into the `Express` namespace globally, every `Request` throughout the app — in any controller, any middleware, any module, without a single extra import — has `req.user` available and correctly typed as `AccessTokenPayload | undefined`, with no casting required. `authenticateToken` is the only place that assigns it; every other consumer (`requireRole`, `authController.me`) only reads it, and the `| undefined` in the type forces every reader to handle the "not authenticated" case rather than assuming a value is always present.
