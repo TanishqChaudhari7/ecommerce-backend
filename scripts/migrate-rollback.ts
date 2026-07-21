@@ -1,7 +1,17 @@
+import { runner } from 'node-pg-migrate';
+import { env } from '../config/env';
 import { logger } from '../config/logger';
 
 async function rollback(): Promise<void> {
-  logger.info('Migration rollback will be implemented in Step 2 (Database & Seed).');
+  await runner({
+    databaseUrl: env.databaseUrl,
+    dir: 'migrations',
+    direction: 'down',
+    count: 1,
+    migrationsTable: 'pgmigrations',
+    log: (msg) => logger.info(msg),
+  });
+  logger.info('Last migration rolled back successfully.');
 }
 
 rollback().catch((error) => {

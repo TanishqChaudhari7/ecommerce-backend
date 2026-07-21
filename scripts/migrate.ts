@@ -1,7 +1,16 @@
+import { runner } from 'node-pg-migrate';
+import { env } from '../config/env';
 import { logger } from '../config/logger';
 
 async function migrate(): Promise<void> {
-  logger.info('Migrations will be implemented in Step 2 (Database & Seed).');
+  await runner({
+    databaseUrl: env.databaseUrl,
+    dir: 'migrations',
+    direction: 'up',
+    migrationsTable: 'pgmigrations',
+    log: (msg) => logger.info(msg),
+  });
+  logger.info('Migrations applied successfully.');
 }
 
 migrate().catch((error) => {

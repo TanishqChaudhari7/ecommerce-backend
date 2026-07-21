@@ -1,10 +1,14 @@
+import { pool } from '../src/config/db';
+import { seed } from '../seeds/seed';
 import { logger } from '../config/logger';
 
-async function seed(): Promise<void> {
-  logger.info('Seeding will be implemented in Step 2 (Database & Seed).');
-}
-
-seed().catch((error) => {
-  logger.error('Seed failed', { error });
-  process.exit(1);
-});
+seed()
+  .then(async () => {
+    logger.info('Seed completed successfully.');
+    await pool.end();
+  })
+  .catch(async (error) => {
+    logger.error('Seed failed', { error });
+    await pool.end();
+    process.exit(1);
+  });
