@@ -67,6 +67,30 @@
 
 ## [Step 4] - Products, Inventory & Search
 
+- Added `kafkajs` as a dependency.
+- Added `src/config/kafka.ts` — a lazily-connected `kafkajs` producer (`Partitioners.DefaultPartitioner` set explicitly) and a `publishEvent(topic, payload)` utility that connects on first use, JSON-serializes the payload, and logs (rather than throws) on failure so a Kafka outage never fails the HTTP request that triggered the event. Also exports `disconnectProducer()` for clean shutdown/test teardown.
+- Extended `src/middleware/validate.ts` with `validateQuery(schema)` (parses `req.query`, attaches result to `res.locals.query`) and `validateParams(schema)` (validates `req.params`, e.g. UUID path params) — both return the same `{ message, errors }` 400 shape as `validateBody`.
+- Extended `src/config/redis.ts` with `deleteKeysByPattern(pattern)`, a non-blocking `SCAN`-based bulk key deletion (cursor-driven, `MATCH`/`COUNT`), used to clear all `search:*` cache entries at once.
+- Added `src/modules/products/products.query.ts` — the shared `PRODUCT_SELECT` SQL (products joined to categories/users/inventory) and `toPublicProduct()` mapper, reused by both the products and search services so the response shape (including `availableStock`, category name, seller info) can't drift between the two.
+- Rebuilt the `products` module (replacing the Step 1 placeholder):
+  - `GET /api/v1/products` — public, paginated (`page`, `limit`, default 20).
+  - `GET /api/v1/products/:id` — public, cache-aside in Redis (`product:{id}`, 10 min TTL).
+  - `POST /api/v1/products` — seller only; creates the product and its `inventory` row (0 stock, DB defaults for the rest) in a single transaction; invalidates `search:*`.
+  - `PUT /api/v1/products/:id` — seller only, must own the product (403 otherwise); partial update via a dynamically-built `SET` clause; invalidates `product:{id}` and `search:*`; publishes `product.updated`.
+  - `DELETE /api/v1/products/:id` — seller only, must own the product; soft delete (`is_deleted = true`); invalidates `product:{id}` and `search:*` (not explicitly listed in the delete spec, but required for the "all queries filter `is_deleted = false`" invariant to hold immediately rather than up to 10 minutes later via a stale cache).
+  - Every query filters `is_deleted = false`; every response includes `availableStock` (`total_stock - reserved_stock`), category name, and seller name/email.
+- Rebuilt the `inventory` module (replacing the Step 1 placeholder):
+  - `PUT /api/v1/inventory/:productId` — seller (own products only) or admin (any product); updates `total_stock`; invalidates `product:{id}` and `search:*` (stock feeds `availableStock` in cached responses); publishes `inventory.updated` only when the resulting `available_stock <= low_stock_threshold`.
+  - `GET /api/v1/inventory/low-stock` — seller (own products) or admin (all products); lists products where `available_stock <= low_stock_threshold`.
+  - Sellers are restricted to their own products on both endpoints even though the task described this as "seller/admin only" without repeating "own products only" — extending the same ownership rule already established for the products endpoints (see ARCHITECTURE.md security notes).
+- Rebuilt the `search` module (replacing the Step 1 placeholder):
+  - `GET /api/v1/search?q=&category=&minPrice=&maxPrice=&brand=&sortBy=&sortOrder=&page=&limit=` — `q` matched via `plainto_tsquery('english', ...)` against `products.search_vector`; `category` matched by slug; `minPrice`/`maxPrice`/`brand` as additional `WHERE` clauses; `sortBy` restricted to `price`/`created_at` and `sortOrder` to `asc`/`desc` by Zod (safe to interpolate directly into `ORDER BY` since only those literal values can pass validation).
+  - Full response cached in Redis at `search:{md5(canonical query)}`, 5 min TTL; the cache key is built from the JSON-stringified, key-sorted validated query object, so equivalent queries in any parameter order hit the same cache entry.
+  - Any product create or update deletes all `search:*` keys via `deleteKeysByPattern`.
+- All new zod schemas live in `<module>.validation.ts` per module (`products.validation.ts`, `inventory.validation.ts`, `search.validation.ts`), consistent with `auth.validation.ts` from Step 3.
+- Documented all 8 new endpoints in Swagger (`@openapi` JSDoc blocks on each route); `/api-docs` now lists 10 endpoints total.
+- Verified end-to-end against the running local PostgreSQL + Redis + Kafka (KRaft-mode, no ZooKeeper) instances, including a live `kafka-console-consumer` on both topics: pagination, cache-aside hit/miss with correct TTL, RBAC (customer/other-seller/admin all rejected appropriately per endpoint), duplicate-SKU 409, soft delete filtered from every subsequent read, `product.updated` and `inventory.updated` payloads observed on their topics (including the conditional low-stock trigger firing only when appropriate), search filters/sort/pagination, cache-key reuse for repeated queries, and cache invalidation on both create and update.
+
 ## [Step 5] - Cart, Orders, Payments & Kafka
 
 ## [Step 6] - Tests, Observability & CI

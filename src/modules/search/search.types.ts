@@ -1,3 +1,6 @@
-export interface SearchPlaceholder {
-  id: string;
+import { Pagination, PublicProduct } from '../products/products.types';
+
+export interface SearchResult {
+  products: PublicProduct[];
+  pagination: Pagination;
 }

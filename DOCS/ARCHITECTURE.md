@@ -214,3 +214,63 @@ declare global {
 ```
 
 Because this merges into the `Express` namespace globally, every `Request` throughout the app — in any controller, any middleware, any module, without a single extra import — has `req.user` available and correctly typed as `AccessTokenPayload | undefined`, with no casting required. `authenticateToken` is the only place that assigns it; every other consumer (`requireRole`, `authController.me`) only reads it, and the `| undefined` in the type forces every reader to handle the "not authenticated" case rather than assuming a value is always present.
+
+## Step 4 - Products, Inventory & Search
+
+### Full-text search with `plainto_tsquery`
+
+`products.search_vector` (populated by the `BEFORE INSERT OR UPDATE` trigger from Step 2) is a `tsvector` built from `name`, `brand`, and `description`. The search endpoint matches it with:
+
+```sql
+WHERE p.search_vector @@ plainto_tsquery('english', $q)
+```
+
+`plainto_tsquery` (rather than `to_tsquery` or `websearch_to_tsquery`) was chosen specifically because it takes plain, unstructured user input — spaces, punctuation, anything a search box might receive — and turns it into an `AND`-of-lexemes query without the caller needing to know `tsquery` operator syntax (`&`, `|`, `!`, `<->`). `to_tsquery` would throw a syntax error on input like `"wireless mouse!"`; `plainto_tsquery` just tokenizes, stems (`'english'` config), and ANDs the terms together. The `@@` operator is what the GIN index on `search_vector` (from Step 2) actually accelerates — without it, this would be a sequential scan with a stemming function call per row.
+
+`category`, `minPrice`/`maxPrice`, and `brand` are plain `WHERE` clauses layered on top with `AND` — they narrow the same result set the tsvector match produces, they don't participate in ranking (no `ts_rank` is used; results are explicitly sorted by `sortBy`/`sortOrder` instead, which the task called for over relevance ranking).
+
+### Redis cache-aside pattern
+
+Both `GET /products/:id` and `GET /search` follow the same shape:
+
+1. Compute a deterministic cache key from the request (`product:{id}`, or `search:{md5(canonical query)}`).
+2. `GET` that key from Redis. Hit → parse and return the cached JSON directly, no database query at all.
+3. Miss → run the real Postgres query, build the response, `SET` it into Redis with an `EX` TTL, then return it.
+
+This is why `PublicProduct.createdAt`/`updatedAt` are typed and stored as ISO **strings**, not `Date` objects: a cache hit returns whatever was `JSON.parse`'d back out of Redis, and a cache miss returns whatever was just built from a fresh DB row. Serializing dates to strings before caching means both paths produce byte-identical shapes — a consumer of this API can't tell, and doesn't need to care, whether a given response came from Postgres or from Redis.
+
+The search cache key is built by taking the *validated* query object (after Zod has applied defaults, e.g. `page=1` when omitted) and running `JSON.stringify(query, Object.keys(query).sort())` before hashing with MD5. Passing the sorted key list as `JSON.stringify`'s replacer argument forces a canonical key order regardless of how the client wrote the query string — `?q=mouse&page=1` and `?page=1&q=mouse` hash to the same cache key, and an unspecified `sortOrder` (defaulted by Zod) doesn't produce a different key than one written explicitly.
+
+### Cache invalidation strategy
+
+- `product:{id}` is deleted directly (single-key `DEL`) whenever that specific product changes: on `PUT`, on soft-`DELETE`, and on an inventory stock update (stock feeds into that product's cached `availableStock`).
+- **Every** `search:*` key is deleted — not just keys that might contain the affected product — on product create, product update, soft delete, and inventory update. This is `deleteKeysByPattern('search:*')` in `src/config/redis.ts`, a non-blocking `SCAN`/`MATCH`/`DEL` loop (chosen over the simpler but blocking `KEYS` command, which would stall the single-threaded Redis server for the duration of the scan on a larger keyspace).
+- The reason it's "delete everything matching `search:*`" rather than "figure out which cached searches contain this product": a cached search result is a full page of products plus a total count, produced by an arbitrary combination of `q`/`category`/`price range`/`brand`/`sort`/`page`. There is no cheap way to know, after the fact, which of those cached combinations a single changed product would have appeared in (or affected the `total` count of) without re-running every cached query — which defeats the purpose of caching. Given the search cache's short 5-minute TTL and that writes (create/update/delete) are comparatively rare next to reads, blanket invalidation trades a brief cache-cold period after any write for correctness, which is the right tradeoff here: serving stale search results (an out-of-stock item still listed, a changed price) is a worse failure mode than a few extra cache misses.
+
+### Available stock and `reserved_stock`
+
+`availableStock` in every product response is computed as `total_stock - reserved_stock`, always at read time (it is never itself stored) — `total_stock` and `reserved_stock` are the columns that change; `availableStock` is a derived view over them.
+
+`reserved_stock` exists as a separate column (rather than decrementing `total_stock` directly whenever something is purchased) because a purchase is a multi-step process — item added to cart, checked out, payment pending, payment confirmed — and stock has to be held for a customer partway through that process without yet being permanently subtracted from what's physically on hand. Step 2's schema already anticipated this: a `CHECK (reserved_stock >= 0 AND reserved_stock <= total_stock)` constraint prevents reserved stock from ever exceeding on-hand stock, no matter which code path updates it. This step only wires up the read side (`availableStock`) and the seller/admin-facing `total_stock` update; the reservation lifecycle itself (incrementing `reserved_stock` on order placement, decrementing both together on fulfillment) is Step 5's concern (Cart, Orders, Payments), once there's an order flow to drive it.
+
+### Soft delete enforcement
+
+Every product-reading query in this step — `listProducts`, `getProductById`, `findOwnableProduct` (used by update/delete ownership checks), the search query, and the inventory low-stock query — includes `p.is_deleted = false` (or, for `findOwnableProduct`, is used specifically so a soft-deleted product can no longer be updated/deleted at all, returning `404` as if it didn't exist). There's no single shared query builder enforcing this centrally; instead every hand-written SQL statement that touches `products` repeats the same literal condition. The `product:{id}` and `search:*` Redis caches only ever get populated from these already-filtered queries, so a soft-deleted product also can't "leak" back into visibility through the cache — but only because delete also explicitly invalidates both caches (see "Cache invalidation strategy" above); without that, a deleted product already sitting in cache could keep being served as available for up to its remaining TTL.
+
+### Kafka producer setup and `publishEvent`
+
+`src/config/kafka.ts` constructs a single `kafkajs` `Producer` at module load (`kafka.producer({ createPartitioner: Partitioners.DefaultPartitioner })`) but does **not** connect immediately — constructing a `Kafka`/`Producer` instance doesn't open a socket, so importing this module (transitively, via `app.ts` → the products/inventory routes) has no side effect and can't leave an open handle in, say, a test run that never actually publishes anything.
+
+`publishEvent(topic, payload)` is the only way the rest of the app talks to Kafka:
+
+1. Lazily connects the producer on first call (`ensureConnected()`, a one-time `producer.connect()` guarded by a module-level `connected` flag).
+2. `JSON.stringify`s the payload and sends it as a single message to `topic`.
+3. Catches and **logs** (via the existing Winston logger) rather than rethrows any failure.
+
+That third point is deliberate: publishing `product.updated`/`inventory.updated` is a side effect of a successful database write, not a precondition for the client's request to succeed. If Kafka is briefly unreachable, a seller updating their product price should still get their `200 OK` — losing an event to a transient broker outage is an acceptable tradeoff for this system's current scope (there's no outbox pattern / guaranteed-delivery requirement yet), versus failing an otherwise-successful product update because a downstream system happened to be down.
+
+Two topics are published today, both from service methods after their triggering write has already committed:
+- `product.updated` — from `ProductsService.updateProduct`, `{ productId, sellerId, updatedAt }`.
+- `inventory.updated` — from `InventoryService.updateStock`, but **only** when the update leaves `available_stock <= low_stock_threshold`; it carries the full stock snapshot (`{ productId, totalStock, reservedStock, availableStock, lowStockThreshold }`) so a consumer doesn't need to re-query the product to decide whether to act (e.g. notify the seller, trigger reordering).
+
+Verified against a real local Kafka broker (KRaft mode, no ZooKeeper) with a `kafka-console-consumer` running against both topics: updating a product produced exactly one `product.updated` message with the expected fields; dropping a product's stock to or below its threshold produced an `inventory.updated` message, while a stock update that stayed above the threshold correctly produced none.
