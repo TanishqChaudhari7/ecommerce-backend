@@ -32,7 +32,7 @@ router.use(authenticateToken);
  *         description: A payment already existed for this paymentKey; it is returned as-is
  *       201:
  *         description: A new pending payment record was created
- *       400:
+ *       422:
  *         description: Validation failed
  *       401:
  *         description: Missing or invalid access token
@@ -74,6 +74,8 @@ router.post(
  *         description: Caller does not own this payment
  *       404:
  *         description: Payment not found
+ *       422:
+ *         description: Invalid paymentId
  */
 router.post(
   '/process/:paymentId',
@@ -106,6 +108,8 @@ router.post(
  *         description: Caller is not an admin
  *       404:
  *         description: Payment not found
+ *       422:
+ *         description: Invalid paymentId
  */
 router.post(
   '/refund/:paymentId',

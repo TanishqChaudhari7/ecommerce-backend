@@ -3,6 +3,19 @@ import { pool } from '../src/config/db';
 
 const PASSWORD = 'Test@1234';
 
+export const ALL_TABLES = [
+  'payments',
+  'order_items',
+  'orders',
+  'cart_items',
+  'shopping_carts',
+  'inventory',
+  'products',
+  'categories',
+  'sessions',
+  'users',
+];
+
 function seedUuid(group: number, index: number): string {
   return `${group.toString().padStart(8, '0')}-0000-4000-8000-${index.toString().padStart(12, '0')}`;
 }

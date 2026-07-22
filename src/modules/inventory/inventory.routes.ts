@@ -55,7 +55,7 @@ router.get(
  *     responses:
  *       200:
  *         description: Updated inventory status; publishes inventory.updated if available stock drops to/below the low-stock threshold
- *       400:
+ *       422:
  *         description: Validation failed
  *       401:
  *         description: Missing or invalid access token

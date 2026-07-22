@@ -41,7 +41,7 @@ const loginRateLimit = rateLimit({
  *     responses:
  *       201:
  *         description: User created
- *       400:
+ *       422:
  *         description: Validation failed
  *       409:
  *         description: Email already registered
@@ -74,7 +74,7 @@ router.post(
  *     responses:
  *       200:
  *         description: Login successful, returns accessToken, refreshToken, and user
- *       400:
+ *       422:
  *         description: Validation failed
  *       401:
  *         description: Invalid email or password
@@ -106,7 +106,7 @@ router.post(
  *     responses:
  *       200:
  *         description: New accessToken and refreshToken
- *       400:
+ *       422:
  *         description: Validation failed
  *       401:
  *         description: Refresh token invalid, expired, or user no longer active
@@ -129,9 +129,9 @@ router.post('/refresh', validateBody(refreshSchema), authController.refresh.bind
  *             properties:
  *               refreshToken: { type: string }
  *     responses:
- *       204:
+ *       200:
  *         description: Logged out
- *       400:
+ *       422:
  *         description: Validation failed
  */
 router.post('/logout', validateBody(logoutSchema), authController.logout.bind(authController));

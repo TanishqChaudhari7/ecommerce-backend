@@ -10,6 +10,7 @@ import {
   UpdateProductInput,
 } from './products.types';
 import { PRODUCT_SELECT, toPublicProduct } from './products.query';
+import { cacheHitsTotal, cacheMissesTotal } from '../../config/metrics';
 
 const PRODUCT_CACHE_TTL_SECONDS = 600;
 
@@ -69,8 +70,10 @@ export class ProductsService {
     const cacheKey = `product:${id}`;
     const cached = await redis.get(cacheKey);
     if (cached) {
+      cacheHitsTotal.inc({ key_pattern: 'product' });
       return JSON.parse(cached) as PublicProduct;
     }
+    cacheMissesTotal.inc({ key_pattern: 'product' });
 
     const result = await pool.query<ProductRow>(
       `${PRODUCT_SELECT} WHERE p.id = $1 AND p.is_deleted = false`,

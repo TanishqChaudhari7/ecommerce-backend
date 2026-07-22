@@ -44,7 +44,7 @@ const router = Router();
  *     responses:
  *       200:
  *         description: Matching products (response is cached in Redis for 5 minutes per unique query)
- *       400:
+ *       422:
  *         description: Validation failed
  */
 router.get('/', validateQuery(searchQuerySchema), searchController.search.bind(searchController));

@@ -67,6 +67,8 @@ router.get('/', ordersController.listOrders.bind(ordersController));
  *         description: Caller does not own this order
  *       404:
  *         description: Order not found
+ *       422:
+ *         description: Invalid id
  */
 router.get(
   '/:id',
@@ -98,6 +100,8 @@ router.get(
  *         description: Caller does not own this order
  *       404:
  *         description: Order not found
+ *       422:
+ *         description: Invalid id
  */
 router.put(
   '/:id/cancel',
@@ -140,6 +144,8 @@ router.put(
  *         description: Caller is not an admin
  *       404:
  *         description: Order not found
+ *       422:
+ *         description: Validation failed (invalid id, or status not one of confirmed/shipped/delivered)
  */
 router.put(
   '/:id/status',

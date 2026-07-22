@@ -3,6 +3,9 @@ import helmet from 'helmet';
 import cors from 'cors';
 import swaggerUi from 'swagger-ui-express';
 import { swaggerSpec } from './config/swagger';
+import { register } from './config/metrics';
+import { requestIdMiddleware } from './middleware/requestId';
+import { metricsMiddleware } from './middleware/metricsMiddleware';
 import { requestLogger } from './middleware/requestLogger';
 import { errorHandler } from './middleware/errorHandler';
 import authRoutes from './modules/auth/auth.routes';
@@ -16,10 +19,12 @@ import searchRoutes from './modules/search/search.routes';
 export function createApp(): Application {
   const app = express();
 
+  app.use(requestIdMiddleware);
   app.use(helmet());
   app.use(cors());
   app.use(express.json());
   app.use(requestLogger);
+  app.use(metricsMiddleware);
 
   app.get('/health', (_req, res) => {
     res.status(200).json({
@@ -27,6 +32,11 @@ export function createApp(): Application {
       uptime: process.uptime(),
       timestamp: new Date().toISOString(),
     });
+  });
+
+  app.get('/metrics', async (_req, res) => {
+    res.set('Content-Type', register.contentType);
+    res.end(await register.metrics());
   });
 
   app.use('/api-docs', swaggerUi.serve, swaggerUi.setup(swaggerSpec));

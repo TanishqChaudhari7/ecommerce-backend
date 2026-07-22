@@ -38,7 +38,7 @@ export class AuthController {
     try {
       const { refreshToken } = req.body as LogoutBody;
       await authService.logout(refreshToken);
-      res.status(204).send();
+      res.status(200).json({ message: 'Logged out' });
     } catch (error) {
       next(error);
     }

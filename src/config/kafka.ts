@@ -1,6 +1,7 @@
 import { Kafka, Partitioners, Producer } from 'kafkajs';
 import { env } from '../../config/env';
 import { logger } from '../../config/logger';
+import { kafkaEventsPublishedTotal } from './metrics';
 
 export const KAFKA_TOPICS = {
   PRODUCT_UPDATED: 'product.updated',
@@ -13,6 +14,17 @@ export const KAFKA_TOPICS = {
 export const kafka = new Kafka({
   clientId: env.kafkaClientId,
   brokers: env.kafkaBrokers,
+  // kafkajs's defaults (5 retries, backoff up to 30s each) mean a single
+  // connection attempt against an unreachable broker can block for minutes.
+  // Since publishEvent is designed to be best-effort (catch and log, never
+  // block the request that triggered it), a slow failure defeats that intent
+  // just as badly as a hang would - fail fast instead.
+  connectionTimeout: 2000,
+  retry: {
+    retries: 1,
+    initialRetryTime: 300,
+    maxRetryTime: 1000,
+  },
 });
 
 export const producer: Producer = kafka.producer({
@@ -35,6 +47,7 @@ export async function publishEvent<T>(topic: string, payload: T): Promise<void> 
       topic,
       messages: [{ value: JSON.stringify(payload) }],
     });
+    kafkaEventsPublishedTotal.inc({ topic });
   } catch (error) {
     logger.error('Failed to publish Kafka event', { topic, error });
   }

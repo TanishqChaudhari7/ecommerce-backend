@@ -5,6 +5,7 @@ import { PRODUCT_SELECT, toPublicProduct } from '../products/products.query';
 import { ProductRow } from '../products/products.types';
 import { SearchQuery } from './search.validation';
 import { SearchResult } from './search.types';
+import { cacheHitsTotal, cacheMissesTotal } from '../../config/metrics';
 
 const SEARCH_CACHE_TTL_SECONDS = 300;
 
@@ -52,8 +53,10 @@ export class SearchService {
     const cacheKey = buildCacheKey(query);
     const cached = await redis.get(cacheKey);
     if (cached) {
+      cacheHitsTotal.inc({ key_pattern: 'search' });
       return JSON.parse(cached) as SearchResult;
     }
+    cacheMissesTotal.inc({ key_pattern: 'search' });
 
     const { whereClause, params } = buildWhereClause(query);
 

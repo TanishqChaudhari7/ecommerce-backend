@@ -67,7 +67,9 @@ router.delete('/', cartController.clearCart.bind(cartController));
  *       201:
  *         description: Updated cart
  *       400:
- *         description: Validation failed, product unavailable, or quantity exceeds available stock
+ *         description: Product unavailable, or quantity exceeds available stock
+ *       422:
+ *         description: Validation failed
  *       401:
  *         description: Missing or invalid access token
  *       403:
@@ -103,7 +105,9 @@ router.post('/items', validateBody(addCartItemSchema), cartController.addItem.bi
  *       200:
  *         description: Updated cart
  *       400:
- *         description: Validation failed, product unavailable, or quantity exceeds available stock
+ *         description: Product unavailable, or quantity exceeds available stock
+ *       422:
+ *         description: Validation failed
  *       401:
  *         description: Missing or invalid access token
  *       403:
@@ -138,6 +142,8 @@ router.put(
  *         description: Missing or invalid access token
  *       403:
  *         description: Caller is not a customer
+ *       422:
+ *         description: Invalid productId
  */
 router.delete(
   '/items/:productId',

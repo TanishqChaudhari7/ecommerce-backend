@@ -49,7 +49,7 @@ router.get(
  *     responses:
  *       200:
  *         description: The product
- *       400:
+ *       422:
  *         description: Invalid id
  *       404:
  *         description: Product not found
@@ -86,7 +86,7 @@ router.get(
  *     responses:
  *       201:
  *         description: Product created; an inventory record with 0 stock is created alongside it
- *       400:
+ *       422:
  *         description: Validation failed
  *       401:
  *         description: Missing or invalid access token
@@ -132,7 +132,7 @@ router.post(
  *     responses:
  *       200:
  *         description: Updated product; invalidates product and search caches and publishes product.updated
- *       400:
+ *       422:
  *         description: Validation failed
  *       401:
  *         description: Missing or invalid access token

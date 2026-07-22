@@ -7,10 +7,14 @@ function get(name: string, fallback: string): string {
   return process.env[name] ?? fallback;
 }
 
+const isTest = get('NODE_ENV', 'development') === 'test';
+
 export const env = {
   nodeEnv: get('NODE_ENV', 'development'),
   port: parseInt(get('PORT', '3000'), 10),
-  databaseUrl: get('DATABASE_URL', 'postgresql://ecommerce:ecommerce@localhost:5432/ecommerce'),
+  databaseUrl: isTest
+    ? get('TEST_DATABASE_URL', 'postgresql://ecommerce:ecommerce@localhost:5432/ecommerce_test')
+    : get('DATABASE_URL', 'postgresql://ecommerce:ecommerce@localhost:5432/ecommerce'),
   redisUrl: get('REDIS_URL', 'redis://localhost:6379'),
   kafkaBrokers: get('KAFKA_BROKERS', 'localhost:9092').split(','),
   kafkaClientId: get('KAFKA_CLIENT_ID', 'ecommerce-backend'),
