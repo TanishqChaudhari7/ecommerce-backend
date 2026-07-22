@@ -1,6 +1,6 @@
 import { pool } from '../../config/db';
 import { redis, deleteKeysByPattern } from '../../config/redis';
-import { publishEvent } from '../../config/kafka';
+import { publishEvent, KAFKA_TOPICS } from '../../config/kafka';
 import { AppError } from '../../utils/AppError';
 import { UserRole } from '../auth/auth.types';
 import { InventoryStatus, LowStockProduct } from './inventory.types';
@@ -44,7 +44,7 @@ export class InventoryService {
     await deleteKeysByPattern('search:*');
 
     if (availableStock <= inventory.low_stock_threshold) {
-      await publishEvent('inventory.updated', {
+      await publishEvent(KAFKA_TOPICS.INVENTORY_UPDATED, {
         productId,
         totalStock: inventory.total_stock,
         reservedStock: inventory.reserved_stock,

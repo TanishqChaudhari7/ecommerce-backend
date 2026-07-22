@@ -1,6 +1,6 @@
 import { pool } from '../../config/db';
 import { redis, deleteKeysByPattern } from '../../config/redis';
-import { publishEvent } from '../../config/kafka';
+import { publishEvent, KAFKA_TOPICS } from '../../config/kafka';
 import { AppError } from '../../utils/AppError';
 import {
   CreateProductInput,
@@ -170,7 +170,7 @@ export class ProductsService {
 
     await redis.del(`product:${id}`);
     await deleteKeysByPattern('search:*');
-    await publishEvent('product.updated', {
+    await publishEvent(KAFKA_TOPICS.PRODUCT_UPDATED, {
       productId: id,
       sellerId,
       updatedAt: new Date().toISOString(),

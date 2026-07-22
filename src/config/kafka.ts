@@ -2,7 +2,15 @@ import { Kafka, Partitioners, Producer } from 'kafkajs';
 import { env } from '../../config/env';
 import { logger } from '../../config/logger';
 
-const kafka = new Kafka({
+export const KAFKA_TOPICS = {
+  PRODUCT_UPDATED: 'product.updated',
+  INVENTORY_UPDATED: 'inventory.updated',
+  ORDER_CREATED: 'order.created',
+  ORDER_CANCELLED: 'order.cancelled',
+  PAYMENT_COMPLETED: 'payment.completed',
+} as const;
+
+export const kafka = new Kafka({
   clientId: env.kafkaClientId,
   brokers: env.kafkaBrokers,
 });

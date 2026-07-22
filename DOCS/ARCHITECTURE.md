@@ -274,3 +274,83 @@ Two topics are published today, both from service methods after their triggering
 - `inventory.updated` — from `InventoryService.updateStock`, but **only** when the update leaves `available_stock <= low_stock_threshold`; it carries the full stock snapshot (`{ productId, totalStock, reservedStock, availableStock, lowStockThreshold }`) so a consumer doesn't need to re-query the product to decide whether to act (e.g. notify the seller, trigger reordering).
 
 Verified against a real local Kafka broker (KRaft mode, no ZooKeeper) with a `kafka-console-consumer` running against both topics: updating a product produced exactly one `product.updated` message with the expected fields; dropping a product's stock to or below its threshold produced an `inventory.updated` message, while a stock update that stayed above the threshold correctly produced none.
+
+## Step 5 - Cart, Orders, Payments & Kafka
+
+### Order placement transaction, step by step
+
+`OrdersService.placeOrder` runs as a single `pg` client transaction (one connection, explicit `BEGIN`/`COMMIT`/`ROLLBACK` — not `pool.query`, which would use a different connection per call and couldn't share a transaction):
+
+1. **`BEGIN`.**
+2. **Find the customer's cart.** No cart row → `400 Cart is empty`. This has to come before anything else touches inventory: there's nothing to reserve stock for yet.
+3. **Read and lock every cart item's product + inventory row (`SELECT ... FOR UPDATE OF i`).** The lock is taken here, before any validation, because validation itself ("is there enough stock?") is only meaningful against a row nobody else can concurrently change out from under it. Locking after validating would defeat the point — a second transaction could slip in between the check and the lock.
+4. **Validate every item:** `is_available` and `quantity <= available_stock` (`total_stock - reserved_stock`, read from the just-locked rows). Any single item failing throws immediately, which unwinds to the `catch` block and rolls back — so a cart with 3 valid items and 1 invalid one reserves nothing for the 3 valid ones either. All-or-nothing was chosen over "reserve what you can" because a partially-fulfilled order is a worse customer experience than a clear "your order couldn't be placed" — and it's what makes the rest of the transaction (a single order with a single consistent total) meaningful.
+5. **Reserve stock**: `UPDATE inventory SET reserved_stock = reserved_stock + quantity` for each item, while still holding the locks from step 3. This is safe precisely because of that lock — no other transaction can be mid-read of the same inventory rows right now.
+6. **Insert the order** (`status = 'pending'`, `total_amount` computed from the locked items' prices — never from client input).
+7. **Insert `order_items`**, one row per cart item, snapshotting `unit_price` at order time (so a later price change on the product never retroactively changes what this order billed).
+8. **Delete the cart's `cart_items`.** The cart is now "spent" — its contents have become an order.
+9. **`COMMIT`.**
+10. *(Outside the transaction, after commit)* invalidate the affected products' `product:{id}`/`search:*` caches (reservation changed `availableStock`), then `publishEvent('order.created', ...)`.
+
+**Deliberate deviation from the task's literal step numbering**: the task listed "7. Publish order.created ... 8. COMMIT" — publish *before* commit. This implementation commits first, then publishes. Publishing before a commit that might still fail (rare, but possible — e.g. a connection drop right before `COMMIT` lands) would mean announcing an order to every Kafka consumer (including the audit log) that doesn't actually exist in the database once the dust settles. Since `publishEvent` never throws (Step 4), there's no correctness reason to publish early, and committing first guarantees every `order.created` event corresponds to a real, durable order.
+
+### Why `reserved_stock` instead of decrementing `total_stock` immediately
+
+This was already set up schema-wise in Step 2 and used read-only in Step 4; Step 5 is where it actually gets exercised end-to-end. The short version: **placing an order is not the same moment as the stock physically leaving the warehouse.** Between "order placed" and "order delivered," a customer can cancel, a payment can fail, an admin can refund — all of which need to give the stock back. If `total_stock` were decremented at order time, "giving it back" would mean incrementing `total_stock` again, which is indistinguishable from *new* stock arriving — there'd be no way to tell "this unit came back because an order was cancelled" from "the seller restocked." Keeping a separate `reserved_stock` counter means:
+
+- `total_stock` only ever changes when stock actually, physically changes (seller restocks it, or an order is `delivered` and the unit is genuinely gone).
+- `reserved_stock` tracks "spoken for but not yet gone" — incremented on order placement, decremented on cancel/refund, and **converted** into a `total_stock` decrease (both drop together) only at `delivered`, the one point where reservation becomes physical fact.
+- `availableStock = total_stock - reserved_stock` is always derivable and never needs its own column or its own invalidation logic beyond the two inputs it's built from.
+
+### Idempotent payment key pattern
+
+`payment_key` is a caller-supplied idempotency token (not server-generated) with a `UNIQUE` constraint backing it since Step 2. `POST /payments/initiate` always checks for an existing row with that key *before* creating anything:
+
+- **First call**, `paymentKey = "abc"`: no existing row → validates the order, inserts a new `pending` payment, returns it with `201`.
+- **Retry** (e.g. the client's HTTP response was lost to a network blip, so it retries the exact same request with the exact same `paymentKey = "abc"`): existing row found → returned as-is with `200`. No second payment row, no double-charge risk, no error — the retry is indistinguishable in effect from the request having simply taken a bit longer.
+- **Race** (two requests with a brand-new key arrive close enough together that both pass the "no existing row" check before either inserts): the second `INSERT` hits the `UNIQUE` constraint and fails; the `catch` block detects the Postgres unique-violation code and re-reads the row the *other* request just inserted, returning that instead of propagating a `500`. The database's own constraint is the actual source of truth for uniqueness; the earlier `SELECT` is just an optimization to skip the round-trip in the common (non-racing) case.
+
+This is why `amount` on the payment is always derived from `orders.total_amount` server-side rather than accepted from the request body: the whole point of an idempotency key is that retrying is safe *because* retrying can't change what actually happens — that guarantee breaks if a client could smuggle in a different amount on a "retry."
+
+### Order status lifecycle
+
+```
+pending → confirmed → shipped → delivered
+   ↓           ↓
+cancelled   cancelled
+```
+
+- **`pending`**: set by `placeOrder`. Stock is reserved; nothing has been paid yet.
+- **`pending → confirmed`**: triggered by `PaymentsService.process` succeeding (the mocked 90% path) — *not* by the admin status endpoint. A payment completing is what confirms an order; there's no other way to reach `confirmed`.
+- **`confirmed → shipped`**, **`shipped → delivered`**: triggered only by an admin calling `PUT /orders/:id/status`. `ALLOWED_TRANSITIONS` is a strict one-step lookup table (`{ pending: 'confirmed', confirmed: 'shipped', shipped: 'delivered' }`); any requested status that isn't exactly the current status's single allowed successor is rejected with `400` — so `pending → shipped` or `confirmed → confirmed` both fail, not just the "backwards" transitions.
+- **`delivered`**: the terminal success state. This is the one status change with an extra side effect — `total_stock` and `reserved_stock` both decrement together, because this is the moment a reservation becomes a permanent, physical stock reduction.
+- **`pending`/`confirmed → cancelled`**: triggered by the customer calling `PUT /orders/:id/cancel` (only legal from these two statuses — once `shipped`, the physical item is already in transit and cancelling stops making sense as a simple stock-release operation) or by an admin refunding a `completed` payment (`PaymentsService.refund`, which cancels the order as part of the same transaction as the refund).
+- **`cancelled`** and **`delivered`** are both terminal — nothing in this codebase transitions an order out of either.
+
+### How `ROLLBACK` works when something fails mid-transaction
+
+Every multi-statement write in this step (`placeOrder`, `cancelOrder`, `updateStatus`, the success path of `process`, `refund`) follows the same shape:
+
+```ts
+const client = await pool.connect();
+try {
+  await client.query('BEGIN');
+  // ... multiple client.query() calls, any of which can throw ...
+  await client.query('COMMIT');
+} catch (error) {
+  await client.query('ROLLBACK');
+  throw error;
+} finally {
+  client.release();
+}
+```
+
+If any statement between `BEGIN` and `COMMIT` throws — a validation `AppError` thrown deliberately by application code (e.g. "insufficient stock"), or a genuine Postgres error (e.g. a `CHECK` constraint violation) — control jumps straight to `catch`, which issues `ROLLBACK` on that same connection before re-throwing. Postgres discards every change made since `BEGIN` as a unit; from any other connection's point of view, it's as if none of the statements in that transaction ever ran. `finally` always releases the connection back to the pool regardless of which path was taken, so a failed transaction doesn't leak a connection. This is what the live concurrency test relied on: when the second of two simultaneous `placeOrder` calls found (after acquiring its `FOR UPDATE` lock) that stock was already exhausted by the first, it threw, rolled back, and left `reserved_stock` exactly as the first transaction's commit had left it — no partial reservation, no phantom order row.
+
+### Kafka consumer design
+
+`src/consumers/index.ts` exports a single `startConsumers()`, called once from `server.ts` (deliberately not from `app.ts` — the health-check unit test imports `app`, and doing this there would mean every test run tries to join real Kafka consumer groups).
+
+- **AuditConsumer** (`groupId: 'audit-consumer'`) subscribes to `Object.values(KAFKA_TOPICS)` — every topic the system currently defines, with no per-topic logic — and logs `[AUDIT] {timestamp} | topic: {topic} | payload: {json}` for each message. Its only job is a complete, human-readable record of everything that happened; if a new topic is added to `KAFKA_TOPICS` in `src/config/kafka.ts`, the audit consumer picks it up automatically with no code change.
+- **InventoryConsumer** (`groupId: 'inventory-consumer'`) subscribes only to `order.cancelled` and is the one consumer that actually changes state. Because `OrdersService.cancelOrder` *already* releases `reserved_stock` synchronously in its own transaction (see the lifecycle section above) before publishing the event, this consumer would double-decrement on every single cancellation if it just blindly repeated that work. It doesn't: both the synchronous handler and the consumer race to claim the same Redis key (`order:stock-released:{orderId}`) via `SET ... NX`, and only the side that wins the claim performs the decrement. In practice the synchronous handler always wins (it claims the key, *then* publishes — so the event literally cannot reach the consumer before the key exists), making the consumer's own decrement path a safety net for scenarios outside this codebase's current scope (e.g. a future service publishing `order.cancelled` directly without going through this HTTP endpoint) rather than something that fires on the normal path. Verified live: cancelling an order produces the audit log line *and* a separate "Reserved stock already released for order ..., skipping" log line from the InventoryConsumer, confirming the guard — not the decrement — is what actually runs.
+- As a second layer of defense independent of the Redis guard, `inventory.reserved_stock` still carries its Step 2 `CHECK (reserved_stock >= 0)` constraint, and the consumer's own decrement uses `GREATEST(reserved_stock - quantity, 0)` rather than a bare subtraction — so even in a hypothetical scenario where the Redis marker was lost (e.g. a Redis restart wiping the key), a duplicate release can't drive the column negative.
