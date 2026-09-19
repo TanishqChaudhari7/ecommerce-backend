@@ -1,0 +1,14 @@
+
+=== Metric B: order throughput (300 orders per arm) ===
+
+-- spread (distinct product per order) --
+sequential (1 in flight)           n= 299  mean=    8.12ms  p50=    8.20ms  p95=   10.42ms  p99=   13.57ms
+concurrent (32 in flight)          n= 300  mean=   24.73ms  p50=   23.67ms  p95=   35.00ms  p99=   37.72ms
+orders ok: 299/300 seq, 300/300 conc
+throughput: 123.1 orders/s -> 1253.8 orders/s (918.4%, 10.18x)
+
+-- contended (all orders, one product) --
+sequential (1 in flight)           n= 300  mean=    7.01ms  p50=    7.39ms  p95=    8.72ms  p99=   16.36ms
+concurrent (32 in flight)          n= 300  mean=   34.04ms  p50=   31.41ms  p95=   57.22ms  p99=   72.41ms
+orders ok: 300/300 seq, 300/300 conc
+throughput: 142.5 orders/s -> 911.5 orders/s (539.5%, 6.40x)

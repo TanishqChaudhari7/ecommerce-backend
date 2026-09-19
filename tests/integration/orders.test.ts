@@ -1,7 +1,12 @@
 import request from 'supertest';
 import { app } from '../../src/app';
 import { pool } from '../../src/config/db';
-import { getSellerToken, getCustomerToken, getAdminToken } from '../helpers/auth';
+import {
+  getSellerToken,
+  getCustomerToken,
+  getAdminToken,
+  createDisposableCustomerToken,
+} from '../helpers/auth';
 
 function freshSku(prefix: string): string {
   return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
@@ -191,5 +196,54 @@ describe('Orders API', () => {
       .set('Authorization', `Bearer ${customerToken}`);
 
     expect(response.status).toBe(400);
+  });
+
+  it('a double-submitted checkout creates exactly one order', async () => {
+    const sellerToken = await getSellerToken();
+
+    // A race only shows up some of the time, so run several independent attempts.
+    for (let trial = 0; trial < 10; trial += 1) {
+      const { userId, token } = await createDisposableCustomerToken();
+      const productId = await createProductWithStock(sellerToken, 10);
+
+      await request(app)
+        .post('/api/v1/cart/items')
+        .set('Authorization', `Bearer ${token}`)
+        .send({ productId, quantity: 2 });
+
+      const responses = await Promise.all([
+        request(app).post('/api/v1/orders').set('Authorization', `Bearer ${token}`),
+        request(app).post('/api/v1/orders').set('Authorization', `Bearer ${token}`),
+      ]);
+
+      expect(responses.map((response) => response.status).sort()).toEqual([201, 400]);
+      const orders = await pool.query('SELECT id FROM orders WHERE user_id = $1', [userId]);
+      expect(orders.rows).toHaveLength(1);
+      expect(await getReservedStock(productId)).toBe(2);
+    }
+  });
+
+  it('refuses to order a product that was deleted while in the cart', async () => {
+    const sellerToken = await getSellerToken();
+    const { token } = await createDisposableCustomerToken();
+    const keptProductId = await createProductWithStock(sellerToken, 10);
+    const deletedProductId = await createProductWithStock(sellerToken, 10);
+
+    for (const productId of [keptProductId, deletedProductId]) {
+      await request(app)
+        .post('/api/v1/cart/items')
+        .set('Authorization', `Bearer ${token}`)
+        .send({ productId, quantity: 1 });
+    }
+    await request(app)
+      .delete(`/api/v1/products/${deletedProductId}`)
+      .set('Authorization', `Bearer ${sellerToken}`);
+
+    const response = await request(app)
+      .post('/api/v1/orders')
+      .set('Authorization', `Bearer ${token}`);
+
+    expect(response.status).toBe(400);
+    expect(await getReservedStock(keptProductId)).toBe(0);
   });
 });

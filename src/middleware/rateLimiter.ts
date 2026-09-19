@@ -7,19 +7,38 @@ interface RateLimitOptions {
   keyPrefix: string;
 }
 
+// Prune, count and record run as one script so concurrent requests can't all read a
+// count below the limit before any of them records itself. Returns -1 when the
+// request is admitted, otherwise the timestamp of the oldest request in the window.
+const SLIDING_WINDOW_SCRIPT = `
+local key = KEYS[1]
+local now = tonumber(ARGV[1])
+local window = tonumber(ARGV[2])
+local max = tonumber(ARGV[3])
+
+redis.call('ZREMRANGEBYSCORE', key, 0, now - window)
+if redis.call('ZCARD', key) >= max then
+  local oldest = redis.call('ZRANGE', key, 0, 0, 'WITHSCORES')
+  return tonumber(oldest[2]) or now
+end
+
+redis.call('ZADD', key, now, ARGV[4])
+redis.call('PEXPIRE', key, window)
+return -1
+`;
+
 export function rateLimit({ windowMs, max, keyPrefix }: RateLimitOptions) {
   return async (req: Request, res: Response, next: NextFunction): Promise<void> => {
     const key = `ratelimit:${keyPrefix}:${req.ip}`;
     const now = Date.now();
-    const windowStart = now - windowMs;
+    const member = `${now}-${Math.random().toString(36).slice(2)}`;
 
     try {
-      await redis.zremrangebyscore(key, 0, windowStart);
-      const count = await redis.zcard(key);
+      const oldestTimestamp = Number(
+        await redis.eval(SLIDING_WINDOW_SCRIPT, 1, key, now, windowMs, max, member),
+      );
 
-      if (count >= max) {
-        const oldest = await redis.zrange(key, 0, 0, 'WITHSCORES');
-        const oldestTimestamp = oldest.length > 0 ? Number(oldest[1]) : now;
+      if (oldestTimestamp >= 0) {
         const retryAfterSeconds = Math.max(1, Math.ceil((oldestTimestamp + windowMs - now) / 1000));
 
         res.setHeader('Retry-After', retryAfterSeconds.toString());
@@ -29,9 +48,6 @@ export function rateLimit({ windowMs, max, keyPrefix }: RateLimitOptions) {
         });
         return;
       }
-
-      await redis.zadd(key, now, `${now}-${Math.random().toString(36).slice(2)}`);
-      await redis.pexpire(key, windowMs);
 
       next();
     } catch (error) {

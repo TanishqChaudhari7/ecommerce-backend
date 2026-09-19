@@ -1,0 +1,13 @@
+Probe: one customer, cart = 2 units of one product (stock 100), two POST /api/v1/orders
+fired at once with the same token. 10 trials. Production build with the cart row lock.
+
+trial 1: statuses=201,400 orders=1 reserved=2
+trial 2: statuses=400,201 orders=1 reserved=2
+trial 3: statuses=400,201 orders=1 reserved=2
+trial 4: statuses=201,400 orders=1 reserved=2
+trial 5: statuses=201,400 orders=1 reserved=2
+trial 6: statuses=201,400 orders=1 reserved=2
+trial 7: statuses=201,400 orders=1 reserved=2
+trial 8: statuses=201,400 orders=1 reserved=2
+trial 9: statuses=201,400 orders=1 reserved=2
+trial 10: statuses=201,400 orders=1 reserved=2

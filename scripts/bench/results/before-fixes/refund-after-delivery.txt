@@ -1,0 +1,9 @@
+Probe: order 3 units (stock 10), pay successfully, admin moves the order to shipped and
+then delivered, then admin refunds the completed payment. Production build, commit
+8a8a271 + the uncommitted orders.service.ts change. (Ad-hoc probe script, not kept.)
+
+status -> shipped: 200
+status -> delivered: 200
+before refund: {"totalStock":7,"reservedStock":0,"available":7}
+refund of delivered order: 500 Internal server error
+after refund: order=delivered {"totalStock":7,"reservedStock":0,"available":7}

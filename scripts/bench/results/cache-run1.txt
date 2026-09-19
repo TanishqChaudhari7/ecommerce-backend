@@ -1,0 +1,13 @@
+
+=== Metric A: product retrieval latency (catalog=8000) ===
+
+-- sequential (1 request at a time) --
+cache MISS (Postgres)              n= 200  mean=    0.96ms  p50=    0.87ms  p95=    1.34ms  p99=    2.69ms
+cache HIT  (Redis)                 n= 200  mean=    0.34ms  p50=    0.32ms  p95=    0.51ms  p99=    1.13ms
+mean: 0.96ms -> 0.34ms (-65.0%)  p95: 1.34ms -> 0.51ms (-61.5%)
+
+-- concurrent (50 in flight, 2000 requests) --
+cache MISS (Postgres)              n=2000  mean=    5.15ms  p50=    4.67ms  p95=    8.98ms  p99=   11.18ms
+cache HIT  (Redis)                 n=2000  mean=    2.67ms  p50=    2.43ms  p95=    5.86ms  p99=    7.24ms
+mean: 5.15ms -> 2.67ms (-48.1%)  p95: 8.98ms -> 5.86ms (-34.7%)
+throughput: 9568 rps -> 18453 rps (92.9%)

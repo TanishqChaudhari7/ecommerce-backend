@@ -9,6 +9,12 @@ function get(name: string, fallback: string): string {
 
 const isTest = get('NODE_ENV', 'development') === 'test';
 
+// The 'change-me' fallback is a local-development convenience; in production it
+// would let anyone who has read this file forge access tokens.
+if (process.env.NODE_ENV === 'production' && !process.env.JWT_SECRET) {
+  throw new Error('JWT_SECRET must be set when NODE_ENV=production');
+}
+
 export const env = {
   nodeEnv: get('NODE_ENV', 'development'),
   port: parseInt(get('PORT', '3000'), 10),

@@ -1,0 +1,8 @@
+
+[run] 200 buyers, 64 concurrent, stock=50
+  confirmed (201):        50
+  rejected  (400):        150
+  errored   (5xx):        0
+  inventory total/reserved: 50/50
+  OVERSOLD orders:        0
+  OVERSOLD units:         0

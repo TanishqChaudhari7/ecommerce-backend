@@ -2,6 +2,7 @@ import { pool } from '../../config/db';
 import { redis, deleteKeysByPattern } from '../../config/redis';
 import { publishEvent, KAFKA_TOPICS } from '../../config/kafka';
 import { AppError } from '../../utils/AppError';
+import { adjustOrderStock } from '../inventory/inventory.stock';
 import { PaymentStatus, PublicPayment } from './payments.types';
 
 interface PaymentRow {
@@ -49,6 +50,9 @@ export class PaymentsService {
     if (existing) {
       if (existing.user_id !== userId) {
         throw new AppError(403, 'This payment key belongs to another user');
+      }
+      if (existing.order_id !== orderId) {
+        throw new AppError(409, 'This payment key was already used for a different order');
       }
       return { payment: toPublicPayment(existing), isNew: false };
     }
@@ -100,40 +104,50 @@ export class PaymentsService {
       throw new AppError(400, `Payment already ${payment.status}`);
     }
 
-    const orderResult = await pool.query<{ status: string }>(
-      'SELECT status FROM orders WHERE id = $1',
-      [payment.order_id],
-    );
-    if (orderResult.rows[0]?.status !== 'pending') {
-      throw new AppError(400, 'Order is no longer awaiting payment');
-    }
-
     const success = Math.random() > 0.1;
-
-    if (!success) {
-      await pool.query("UPDATE payments SET status = 'failed' WHERE id = $1", [paymentId]);
-      throw new AppError(402, 'Payment failed');
-    }
 
     const client = await pool.connect();
     let updatedPayment: PaymentRow;
     try {
       await client.query('BEGIN');
-      const updateResult = await client.query<PaymentRow>(
-        "UPDATE payments SET status = 'completed' WHERE id = $1 RETURNING *",
-        [paymentId],
-      );
-      updatedPayment = updateResult.rows[0];
-      await client.query(
-        "UPDATE orders SET status = 'confirmed', updated_at = now() WHERE id = $1",
+
+      // The checks above were unlocked and only give fast, friendly errors. Under the
+      // order lock, re-check both states so that two concurrent attempts - on this
+      // payment, or on two different payments for the same order - can't both charge.
+      const orderResult = await client.query<{ status: string }>(
+        'SELECT status FROM orders WHERE id = $1 FOR UPDATE',
         [payment.order_id],
       );
+      if (orderResult.rows[0]?.status !== 'pending') {
+        throw new AppError(400, 'Order is no longer awaiting payment');
+      }
+
+      const updateResult = await client.query<PaymentRow>(
+        `UPDATE payments SET status = $2 WHERE id = $1 AND status = 'pending' RETURNING *`,
+        [paymentId, success ? 'completed' : 'failed'],
+      );
+      if (updateResult.rows.length === 0) {
+        throw new AppError(400, 'Payment already processed');
+      }
+      updatedPayment = updateResult.rows[0];
+
+      if (success) {
+        await client.query(
+          "UPDATE orders SET status = 'confirmed', updated_at = now() WHERE id = $1",
+          [payment.order_id],
+        );
+      }
+
       await client.query('COMMIT');
     } catch (error) {
       await client.query('ROLLBACK');
       throw error;
     } finally {
       client.release();
+    }
+
+    if (!success) {
+      throw new AppError(402, 'Payment failed');
     }
 
     await publishEvent(KAFKA_TOPICS.PAYMENT_COMPLETED, {
@@ -154,30 +168,37 @@ export class PaymentsService {
     try {
       await client.query('BEGIN');
 
+      const orderIdResult = await client.query<{ order_id: string }>(
+        'SELECT order_id FROM payments WHERE id = $1',
+        [paymentId],
+      );
+      const orderId = orderIdResult.rows[0]?.order_id;
+      if (!orderId) {
+        throw new AppError(404, 'Payment not found');
+      }
+
+      // Lock the order before the payment - the same order cancelOrder and process
+      // use - so a refund can't deadlock with them or race an admin shipping it.
+      const orderResult = await client.query<{ status: string }>(
+        'SELECT status FROM orders WHERE id = $1 FOR UPDATE',
+        [orderId],
+      );
       const paymentResult = await client.query<PaymentRow>(
         'SELECT * FROM payments WHERE id = $1 FOR UPDATE',
         [paymentId],
       );
       const payment = paymentResult.rows[0];
-      if (!payment) {
-        throw new AppError(404, 'Payment not found');
-      }
       if (payment.status !== 'completed') {
         throw new AppError(400, `Cannot refund a payment with status ${payment.status}`);
       }
-
-      const itemsResult = await client.query<{ product_id: string; quantity: number }>(
-        'SELECT product_id, quantity FROM order_items WHERE order_id = $1',
-        [payment.order_id],
-      );
-
-      for (const item of itemsResult.rows) {
-        await client.query(
-          'UPDATE inventory SET reserved_stock = reserved_stock - $1 WHERE product_id = $2',
-          [item.quantity, item.product_id],
-        );
+      // Once shipped, the reservation is on its way to being (or has been) consumed;
+      // releasing it here would free stock that belongs to other orders.
+      const orderStatus = orderResult.rows[0].status;
+      if (orderStatus !== 'confirmed') {
+        throw new AppError(400, `Cannot refund an order with status ${orderStatus}`);
       }
-      affectedProductIds = itemsResult.rows.map((item) => item.product_id);
+
+      affectedProductIds = await adjustOrderStock(client, orderId, 'release');
 
       const updateResult = await client.query<PaymentRow>(
         "UPDATE payments SET status = 'refunded' WHERE id = $1 RETURNING *",
@@ -187,7 +208,7 @@ export class PaymentsService {
 
       await client.query(
         "UPDATE orders SET status = 'cancelled', updated_at = now() WHERE id = $1",
-        [payment.order_id],
+        [orderId],
       );
 
       await client.query('COMMIT');

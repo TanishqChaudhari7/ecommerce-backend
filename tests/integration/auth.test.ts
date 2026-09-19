@@ -1,6 +1,7 @@
 import request from 'supertest';
 import { app } from '../../src/app';
-import { uniqueEmail } from '../helpers/auth';
+import { pool } from '../../src/config/db';
+import { uniqueEmail, createDisposableCustomerToken } from '../helpers/auth';
 
 describe('Auth API', () => {
   it('registers with valid data and returns 201', async () => {
@@ -119,5 +120,25 @@ describe('Auth API', () => {
       .post('/api/v1/auth/refresh')
       .send({ refreshToken: login.body.refreshToken });
     expect(refreshAfterLogout.status).toBe(401);
+  });
+
+  it('lets only one of two concurrent refreshes with the same token succeed', async () => {
+    // A race only shows up some of the time, so run several independent attempts.
+    for (let trial = 0; trial < 10; trial += 1) {
+      const { userId } = await createDisposableCustomerToken();
+      const refreshToken = `concurrent-refresh-${userId}`;
+      await pool.query(
+        `INSERT INTO sessions (user_id, refresh_token, expires_at)
+         VALUES ($1, $2, now() + interval '1 day')`,
+        [userId, refreshToken],
+      );
+
+      const responses = await Promise.all([
+        request(app).post('/api/v1/auth/refresh').send({ refreshToken }),
+        request(app).post('/api/v1/auth/refresh').send({ refreshToken }),
+      ]);
+
+      expect(responses.map((response) => response.status).sort()).toEqual([200, 401]);
+    }
   });
 });

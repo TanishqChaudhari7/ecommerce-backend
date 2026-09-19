@@ -1,0 +1,17 @@
+A/B: throughput.ts with and without the shopping_carts FOR UPDATE in placeOrder.
+The two builds differ only in that one statement (edited in the compiled dist file).
+Runs alternated without, with, without, with. In each pair of lines, the first line
+is the spread arm and the second is the one-product arm (sequential -> 32 in flight).
+
+== without
+throughput: 132.8 orders/s -> 1110.6 orders/s (736.3%, 8.36x)
+throughput: 156.1 orders/s -> 1077.4 orders/s (590.0%, 6.90x)
+== with
+throughput: 129.3 orders/s -> 1182.8 orders/s (814.5%, 9.15x)
+throughput: 140.5 orders/s -> 1144.3 orders/s (714.4%, 8.14x)
+== without
+throughput: 120.7 orders/s -> 1160.4 orders/s (861.1%, 9.61x)
+throughput: 129.4 orders/s -> 1150.0 orders/s (788.4%, 8.88x)
+== with
+throughput: 138.5 orders/s -> 1225.1 orders/s (784.5%, 8.85x)
+throughput: 163.3 orders/s -> 1190.2 orders/s (628.9%, 7.29x)

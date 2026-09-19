@@ -138,4 +138,99 @@ describe('Payments API', () => {
     );
     expect(inventoryResult.rows[0].reserved_stock).toBe(0);
   });
+
+  it('refuses to refund an order that has already shipped', async () => {
+    const sellerToken = await getSellerToken();
+    const customerToken = await getCustomerToken();
+    const adminToken = await getAdminToken();
+    const { orderId, productId } = await placeFreshOrder(sellerToken, customerToken);
+    const { paymentId } = await processUntilSuccess(customerToken, orderId);
+
+    await request(app)
+      .put(`/api/v1/orders/${orderId}/status`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({ status: 'shipped' });
+
+    const refundResponse = await request(app)
+      .post(`/api/v1/payments/refund/${paymentId}`)
+      .set('Authorization', `Bearer ${adminToken}`);
+
+    expect(refundResponse.status).toBe(400);
+    const inventoryResult = await pool.query<{ reserved_stock: number }>(
+      'SELECT reserved_stock FROM inventory WHERE product_id = $1',
+      [productId],
+    );
+    expect(inventoryResult.rows[0].reserved_stock).toBe(1);
+  });
+
+  it('cancelling a paid order refunds its payment', async () => {
+    const sellerToken = await getSellerToken();
+    const customerToken = await getCustomerToken();
+    const { orderId } = await placeFreshOrder(sellerToken, customerToken);
+    const { paymentId } = await processUntilSuccess(customerToken, orderId);
+
+    const cancelResponse = await request(app)
+      .put(`/api/v1/orders/${orderId}/cancel`)
+      .set('Authorization', `Bearer ${customerToken}`);
+    expect(cancelResponse.status).toBe(200);
+
+    const paymentResult = await pool.query<{ status: string }>(
+      'SELECT status FROM payments WHERE id = $1',
+      [paymentId],
+    );
+    expect(paymentResult.rows[0].status).toBe('refunded');
+  });
+
+  it('rejects a payment key reused for a different order', async () => {
+    const sellerToken = await getSellerToken();
+    const customerToken = await getCustomerToken();
+    const first = await placeFreshOrder(sellerToken, customerToken);
+    const second = await placeFreshOrder(sellerToken, customerToken);
+    const paymentKey = `PAY-REUSE-${first.orderId}`;
+
+    await request(app)
+      .post('/api/v1/payments/initiate')
+      .set('Authorization', `Bearer ${customerToken}`)
+      .send({ orderId: first.orderId, paymentKey });
+    const reuse = await request(app)
+      .post('/api/v1/payments/initiate')
+      .set('Authorization', `Bearer ${customerToken}`)
+      .send({ orderId: second.orderId, paymentKey });
+
+    expect(reuse.status).toBe(409);
+  });
+
+  it('never completes two payments for one order processed at the same time', async () => {
+    const sellerToken = await getSellerToken();
+    const customerToken = await getCustomerToken();
+
+    // A race only shows up some of the time, so run several independent attempts.
+    for (let trial = 0; trial < 10; trial += 1) {
+      const { orderId } = await placeFreshOrder(sellerToken, customerToken);
+
+      const paymentIds: string[] = [];
+      for (const suffix of ['A', 'B', 'C', 'D']) {
+        const initiate = await request(app)
+          .post('/api/v1/payments/initiate')
+          .set('Authorization', `Bearer ${customerToken}`)
+          .send({ orderId, paymentKey: `PAY-RACE-${orderId}-${suffix}` });
+        paymentIds.push(initiate.body.payment.id);
+      }
+
+      const responses = await Promise.all(
+        paymentIds.map((paymentId) =>
+          request(app)
+            .post(`/api/v1/payments/process/${paymentId}`)
+            .set('Authorization', `Bearer ${customerToken}`),
+        ),
+      );
+
+      expect(responses.every((response) => response.status < 500)).toBe(true);
+      const completed = await pool.query(
+        "SELECT id FROM payments WHERE order_id = $1 AND status = 'completed'",
+        [orderId],
+      );
+      expect(completed.rows.length).toBeLessThanOrEqual(1);
+    }
+  });
 });

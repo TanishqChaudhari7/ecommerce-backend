@@ -1,341 +1,706 @@
-# Architecture
+# E-Commerce Backend Architecture
 
-## Step 1 - Scaffold & Infrastructure
+This is the backend for an online store, written in TypeScript on Node.js and
+Express, with PostgreSQL as the source of truth, Redis for caching and rate
+limiting, and Kafka for domain events. This document describes the whole system,
+from the schema up to the HTTP layer, and reads top to bottom. Measured numbers
+appear only in §15; every one of them comes from the raw benchmark output in
+`scripts/bench/results/`.
 
-### Files created
+**Contents**
 
-| File | Responsibility |
-|---|---|
-| `tsconfig.json` | Strict-mode TypeScript compiler config for the production build (`src/`, `config/`). |
-| `tsconfig.eslint.json` | Extends `tsconfig.json` but also includes `scripts/` and `tests/`, so ESLint's type-aware rules can lint them without those folders being part of the compiled `dist/` output. |
-| `.eslintrc.cjs` | ESLint rules (`@typescript-eslint` + `eslint-plugin-prettier`) run against every `.ts` file. |
-| `.prettierrc.json` / `.prettierignore` | Formatting rules and paths Prettier skips. |
-| `nodemon.json` | Watches `src/` and `config/`, restarts `ts-node src/server.ts` on change (used by `npm run dev`). |
-| `jest.config.js` | `ts-jest` preset; test discovery restricted to `tests/**/*.test.ts`. |
-| `.env.example` | Documents every environment variable the app reads, with inline comments. |
-| `docker-compose.yml` | Local infrastructure: PostgreSQL (5432), Redis (6379), Kafka + Zookeeper (9092), and the app container. |
-| `Dockerfile` | Multi-stage build — installs deps and compiles TypeScript in a `builder` stage, then copies only `dist/` + production deps into the final image. |
-| `.dockerignore` | Keeps `node_modules`, `dist`, tests, and docs out of the Docker build context. |
-| `config/env.ts` | Loads `.env` via `dotenv` and exports a single typed `env` object; every other module reads config through this, never `process.env` directly. |
-| `config/logger.ts` | Creates the Winston logger: colorized human-readable output in development, JSON in production. |
-| `src/app.ts` | Builds the Express `Application`: JSON body parsing, request logging, `/health`, module routers, error handler. Exported separately from `server.ts` so tests can import `app` without binding a port. |
-| `src/server.ts` | Entrypoint — starts the HTTP listener on `env.port` and installs `unhandledRejection` / `uncaughtException` handlers. |
-| `src/middleware/requestLogger.ts` | Logs method, path, status code, and duration for every request at the `http` log level once the response finishes. |
-| `src/middleware/errorHandler.ts` | Express 4-arg error middleware. Reads `err.statusCode` (defaults to 500), logs the error, and returns a JSON body that omits the stack trace in production. |
-| `src/modules/<name>/<name>.routes.ts` | Registers the module's `Router`; currently a single `GET /` wired to the controller. |
-| `src/modules/<name>/<name>.controller.ts` | Express request handler; delegates to the service and returns `501 Not Implemented` (placeholder pending later steps). |
-| `src/modules/<name>/<name>.service.ts` | Business-logic layer, currently a `ping()` stub. Controllers never talk to the database/cache directly — they always go through a service. |
-| `src/modules/<name>/<name>.types.ts` | Module-local TypeScript types/interfaces. |
-| `scripts/migrate.ts`, `migrate-rollback.ts`, `seed.ts`, `seed-fresh.ts` | CLI entrypoints run via `ts-node`, invoked by the `npm run migrate*` / `seed*` scripts. Currently log a placeholder message; real DB logic lands in Step 2. |
-| `tests/unit/health.test.ts` | Supertest-driven test asserting `/health` returns `status`, `uptime`, `timestamp`. |
-| `migrations/`, `seeds/` | Empty (tracked via `.gitkeep`), populated in Step 2. |
-| `tests/integration/`, `tests/concurrency/` | Empty (tracked via `.gitkeep`); `npm run test:integration` / `test:concurrency` pass with `--passWithNoTests` until real suites exist. |
+1. [Problem statement](#1-problem-statement)
+2. [Requirements](#2-requirements)
+3. [Non-goals](#3-non-goals)
+4. [High-level architecture](#4-high-level-architecture)
+5. [Data model](#5-data-model)
+6. [Request pipeline](#6-request-pipeline)
+7. [Authentication and authorization](#7-authentication-and-authorization)
+8. [Catalog and search](#8-catalog-and-search)
+9. [Caching](#9-caching)
+10. [Checkout and inventory concurrency](#10-checkout-and-inventory-concurrency)
+11. [Order lifecycle and payments](#11-order-lifecycle-and-payments)
+12. [Events](#12-events)
+13. [Observability](#13-observability)
+14. [Benchmark methodology](#14-benchmark-methodology)
+15. [Performance results](#15-performance-results)
+16. [Tradeoffs](#16-tradeoffs)
+17. [Failure modes](#17-failure-modes)
+18. [Future improvements](#18-future-improvements)
+- [Appendix: interview questions](#appendix-interview-questions)
 
-### Folder structure
+---
+
+## 1. Problem statement
+
+A store sells a finite amount of stock to many customers at once. The hard part
+is not listing products. It is making sure the store never promises the same
+unit twice, while staying fast when most traffic is browsing.
+
+Building that backend means answering five questions:
+
+- **Stock is finite and contended.** When many customers check out the same
+  item at the same moment, how is overselling made impossible rather than
+  unlikely?
+- **Checkout is several writes.** Reserving stock, creating the order, copying
+  its lines and emptying the cart must all happen or none of them. How?
+- **Clients retry.** A payment request whose response was lost will be sent
+  again. How does a retry avoid charging twice?
+- **Reads dominate.** Product pages and searches vastly outnumber purchases.
+  How are they served without a database query each time, and without showing
+  stale stock or prices?
+- **Other systems need to know.** Auditing and inventory follow-up should not
+  sit inside the request that caused them. How are they decoupled?
+
+This codebase answers each one in a form small enough to explain file by file.
+
+---
+
+## 2. Requirements
+
+### Functional
+
+| Requirement | Implementation |
+| --- | --- |
+| Register, log in, refresh and log out | JWT access token plus rotating opaque refresh token (§7) |
+| Three roles with different permissions | `customer`, `seller`, `admin`, enforced per route (§7) |
+| Sellers manage their own products and stock | Ownership checks in the service layer (§8) |
+| Browse, look up and search products | Paginated list, lookup by id, full-text search with filters (§8) |
+| One cart per customer | `shopping_carts` with a unique `user_id` (§5) |
+| Place an order from the cart without overselling | One transaction with row locks on inventory (§10) |
+| Cancel, ship and deliver orders | Explicit status machine (§11) |
+| Pay for an order, safely retryable; refund | Client-supplied idempotency key (§11) |
+| Notify other systems of domain events | Kafka topics and two consumers (§12) |
+
+### Non-functional
+
+| Requirement | How it is met |
+| --- | --- |
+| No overselling under concurrent checkout | `SELECT … FOR UPDATE` on inventory rows, plus a `CHECK` constraint as a backstop (§10); an integration test and a benchmark exercise it (§15) |
+| No partial orders | Explicit `BEGIN` / `COMMIT` / `ROLLBACK` on one connection (§10) |
+| Hot reads served from memory | Cache-aside in Redis with invalidation on every write that changes the cached data (§9) |
+| Brute-force resistance on login | Sliding-window rate limit per IP in Redis; bcrypt cost 12 (§7) |
+| Every log line traceable to one request | Request id held in `AsyncLocalStorage` and added to every log line (§13) |
+| Operational visibility | Prometheus metrics at `/metrics` (§13) |
+| Correctness checked automatically | 41 Jest tests against real Postgres and Redis, including repeated race tests; lint, test, type-check and Docker build in CI (§13) |
+
+---
+
+## 3. Non-goals
+
+Each of these is excluded deliberately.
+
+- **A real payment provider.** `process` succeeds with probability 0.9 (`Math.random() > 0.1`). The integration point is where a provider call would go; the idempotency design around it is the point.
+- **Horizontal scale-out.** One process, one Postgres, one Redis, one Kafka broker. Nothing prevents running several app instances (state lives in Postgres and Redis), but it has not been designed or tested for.
+- **Guaranteed event delivery.** Events are published after commit, best effort, with no outbox (§12). Postgres is the record; Kafka is a notification.
+- **Reservation expiry.** Stock reserved by an unpaid `pending` order stays reserved until the order is cancelled. There is no timeout.
+- **Relevance ranking.** Search filters with full-text matching but sorts by price or date, never by `ts_rank` (§8).
+- **Multi-currency, tax, shipping, discounts.** Prices are one `numeric(10,2)` column.
+- **Graceful shutdown.** There is no `SIGTERM` handler; in-flight transactions are rolled back by Postgres when their connections drop.
+
+---
+
+## 4. High-level architecture
 
 ```
-config/            Environment loading + logger, shared by src/, scripts/, tests/
-migrations/         SQL/migration files (populated in Step 2)
-seeds/              Seed data/scripts (populated in Step 2)
-scripts/            One-off CLI entrypoints (migrate, seed) run via ts-node
-src/
-  app.ts            Express app construction (no listening)
-  server.ts          Process entrypoint (listens, signal handlers)
-  middleware/        Cross-cutting Express middleware
-  modules/<name>/    One folder per business domain: controller, service, routes, types
-tests/
-  unit/              Fast, no external dependencies (jest — `npm test`)
-  integration/       Hits real Postgres/Redis/Kafka via docker-compose (`npm run test:integration`)
-  concurrency/        Race-condition / load-style tests (`npm run test:concurrency`)
-DOCS/                Architecture, run instructions, testing guide, changelog
+   frontend / curl / supertest
+                  |
+                  |  HTTP + JSON, Bearer access token
+                  v
+   +--------------------------------------------------+
+   |  Express app          global middleware          |  src/app.ts
+   |  requestId > helmet > cors > json > log > metrics|  src/middleware/
+   +--------------------------------------------------+
+                  |  /api/v1/<module>
+                  v
+   +--------------------------------------------------+
+   |  Route         authenticateToken > requireRole > |  <module>.routes.ts
+   |                validate (zod) > controller       |
+   +--------------------------------------------------+
+                  |  plain arguments, no req / res
+                  v
+   +--------------------------------------------------+
+   |  Service       business rules, transactions,     |  <module>.service.ts
+   |                cache reads and invalidation,     |
+   |                event publishing                  |
+   +--------------------------------------------------+
+        |                    |                   |
+        v                    v                   v
+   +-----------+      +--------------+     +-----------+
+   | PostgreSQL|      |    Redis     |     |   Kafka   |
+   | source of |      | cache, rate  |     |  events   |
+   | truth     |      | limits, flags|     |           |
+   +-----------+      +--------------+     +-----------+
+        ^                    ^                   |
+        |                    |                   v
+        +--------------------+------- consumers (same process)
+                                      audit log, stock release
 ```
 
-Each module folder is self-contained and has no imports from sibling modules — cross-module logic will be composed at the route/service level in later steps rather than modules importing each other directly.
+### Components
 
-### Request flow
+| Component | Responsibility | Files |
+| --- | --- | --- |
+| `createApp` | Middleware order, `/health`, `/metrics`, `/api-docs`, module mounting | `src/app.ts` |
+| Entry point | Listen on a port, start Kafka consumers, process-level error handlers | `src/server.ts` |
+| `env`, `logger` | Typed configuration; Winston logger with request ids | `config/env.ts`, `config/logger.ts` |
+| `pool`, `redis`, `producer` | One shared client each for Postgres, Redis and Kafka | `src/config/db.ts`, `redis.ts`, `kafka.ts` |
+| Metrics registry | Five Prometheus series | `src/config/metrics.ts` |
+| Middleware | Request id, auth, roles, validation, rate limit, logging, metrics, errors | `src/middleware/*.ts` |
+| `auth` module | Register, login, refresh, logout, `me` | `src/modules/auth/` |
+| `products` module | List, lookup, create, update, soft delete | `src/modules/products/` |
+| `search` module | Full-text search with filters, sort and pagination | `src/modules/search/` |
+| `inventory` module | Set total stock; list low-stock products; `adjustOrderStock`, used by orders and payments | `src/modules/inventory/` |
+| `cart` module | Cart contents for the current customer | `src/modules/cart/` |
+| `orders` module | Checkout, list, view, cancel, status changes | `src/modules/orders/` |
+| `payments` module | Initiate, process, refund | `src/modules/payments/` |
+| Consumers | Audit log of every topic; stock release on `order.cancelled` | `src/consumers/index.ts` |
+| `AppError` | An `Error` carrying an HTTP status code | `src/utils/AppError.ts` |
+| Request context | `AsyncLocalStorage` holding the request id | `src/utils/requestContext.ts` |
 
-1. **`src/server.ts`** starts the HTTP server on `env.port`, delegating request handling to the `app` built in `src/app.ts`.
-2. **`express.json()`** parses the request body.
-3. **`requestLogger`** records the start time and registers a `res.on('finish', ...)` listener that logs method, path, status, and duration once the response is sent.
-4. The request is matched against routes in order: `GET /health` first, then each module's router mounted at `/api/v1/<module>` (e.g. `/api/v1/products` → `src/modules/products/products.routes.ts`).
-5. A matched module route calls its **controller**, which calls its **service**, and sends the JSON response (currently `501` placeholders for all modules).
-6. If a handler throws or calls `next(error)`, Express skips remaining routes and invokes **`errorHandler`**, the last middleware registered in `app.ts`. It logs the error via Winston and responds with a JSON error body (stack trace included only outside production).
-7. Whether the response succeeded or errored, the `finish` event fires and `requestLogger` writes the access log line.
+### Module layout and the dependency rule
 
-### Patterns used
+Every module has the same five files:
 
-- **Controller → Service separation**: controllers only handle HTTP concerns (parsing req, shaping res, calling `next(error)`); business logic lives in services so it can be unit-tested and reused without an HTTP layer.
-- **Centralized config object**: `config/env.ts` is the single source of truth for environment variables; no other file reads `process.env` directly.
-- **Structured logging over `console.log`**: all logging goes through the Winston `logger`, so output format (JSON vs. pretty) is controlled centrally by environment.
-- **Fail-fast process handlers**: unhandled rejections are logged; uncaught exceptions are logged and the process exits, favoring a container restart over running in a corrupted state.
-- **Build/lint split via two tsconfigs**: `tsconfig.json` defines what actually ships (`src/`, `config/`); `tsconfig.eslint.json` widens that only for static analysis, so `scripts/` and `tests/` get full type-aware linting without being bundled into `dist/`.
+```
+src/modules/<name>/
+  <name>.routes.ts       Router: middleware chain per endpoint, Swagger comments
+  <name>.controller.ts   HTTP only: read req, call service, write res, next(error)
+  <name>.service.ts      Business rules: SQL, transactions, cache, events
+  <name>.validation.ts   zod schemas and the types inferred from them
+  <name>.types.ts        Row types and public response shapes
+```
 
-## Step 2 - Database & Seed
+The rules, and where they are broken:
+
+- **Controllers never touch `pool`, `redis` or Kafka.** They call exactly one service method and shape the response.
+- **Services never see `req` or `res`.** They take plain values (`userId`, `role`, a validated body) and return plain objects. This is what lets them run from tests, scripts or consumers without an HTTP request.
+- **Services do know HTTP status codes.** They throw `new AppError(404, …)`. This is a deliberate shortcut: a separate domain-error type mapped to status codes in one place would be cleaner, but would add a layer that does nothing else here.
+- **Modules do not import each other's services.** The cross-module imports are types (`UserRole` from `auth`); `search` reusing `products.query.ts`, so that a product looks identical whether it came from `/products/:id` or `/search`; and `orders` and `payments` using `inventory/inventory.stock.ts`, so every stock release or consumption after checkout locks rows the same way (§10).
+- **`app.ts` does not start consumers.** `server.ts` does. Tests import `app` without joining Kafka consumer groups or binding a port.
+
+### Life of a request
+
+```
+  POST /api/v1/orders   Authorization: Bearer <jwt>
+     -> requestIdMiddleware       new UUID; X-Request-ID header; AsyncLocalStorage
+     -> helmet, cors, express.json
+     -> requestLogger, metrics     register res.on('finish') hooks
+     -> ordersRouter
+          -> authenticateToken     verify JWT signature and expiry -> req.user
+          -> requireRole('customer')
+          -> OrdersController.placeOrder
+               -> OrdersService.placeOrder(userId)
+                    BEGIN
+                    SELECT cart ... FOR UPDATE
+                    SELECT cart items + inventory ... ORDER BY product_id FOR UPDATE OF i
+                    validate every line; UPDATE inventory reserved_stock (one statement)
+                    INSERT order; INSERT order_items (one statement); DELETE cart_items
+                    COMMIT
+                    DEL product:{id}...; SCAN+DEL search:*       Redis
+                    publish order.created                         Kafka, best effort
+                    read back the order (3 queries in parallel)
+     <- 201 {"order": {...}}
+     -> 'finish': access log line, http_requests_total, duration histogram
+```
+
+---
+
+## 5. Data model
 
 ### Tables
 
-| Table | Stores | Why |
-|---|---|---|
-| `users` | Every account: customers, sellers, and admins, distinguished by `role`. | A single table (not per-role tables) keeps auth/session logic uniform; `role` drives authorization in later steps. |
-| `sessions` | Issued refresh tokens per user, with expiry. | Lets refresh tokens be revoked/rotated server-side (delete the row) instead of only relying on JWT expiry. |
-| `categories` | Product categories, self-referencing via `parent_id`. | `parent_id` allows an arbitrarily nested category tree (e.g. Electronics → Audio → Headphones) without a separate table. |
-| `products` | Product catalog: pricing, ownership, availability, and the full-text `search_vector`. | Core sellable entity; owned by a seller, optionally filed under a category. |
-| `inventory` | Stock counts per product: `total_stock`, `reserved_stock`, `low_stock_threshold`. | Split from `products` so stock can be updated/locked independently of catalog metadata (different write patterns/frequency). |
-| `shopping_carts` | One active cart per user. | Kept separate from `cart_items` so the cart itself has an identity (and a `created_at`) independent of its contents. |
-| `cart_items` | Line items (product + quantity) in a cart. | Many-to-many between carts and products, with quantity as the edge attribute. |
-| `orders` | A placed order: owning user, `status`, `total_amount`. | The durable, immutable-once-placed record of a transaction; separate from the cart, which is mutable and pre-purchase. |
-| `order_items` | Line items of an order, with `unit_price` captured at order time. | Preserves historical pricing even if `products.price` changes later — orders must never retroactively change value. |
-| `payments` | Payment attempts/results against an order, with a unique `payment_key`. | Kept separate from `orders` so an order can have multiple payment attempts (e.g. a failed charge followed by a successful retry) without mutating order state. |
+```
+  users 1 ---- * sessions
+    |
+    +-- 1 ---- * products * ---- 0..1 categories  (parent_id -> categories)
+    |              |
+    |              +-- 1 ---- 1 inventory
+    |
+    +-- 1 ---- 1 shopping_carts 1 ---- * cart_items * ---- 1 products
+    |
+    +-- 1 ---- * orders 1 ---- * order_items * ---- 1 products
+    |              |
+    +-- 1 ---- * payments * ---- 1 orders
+```
 
-### Key relationships
+| Table | Stores | Why it is separate |
+| --- | --- | --- |
+| `users` | Every account; `role` is an enum `customer`, `seller`, `admin` | One table keeps authentication uniform; the role drives authorization |
+| `sessions` | Refresh tokens with expiry | Makes refresh tokens revocable by deleting a row (§7) |
+| `categories` | Name, unique `slug`, optional `parent_id` | Nested categories without a second table |
+| `products` | Catalog data, owner, `is_deleted`, `search_vector` | The sellable thing |
+| `inventory` | `total_stock`, `reserved_stock`, `low_stock_threshold` | Stock is written far more often than catalog data and is what checkout locks (§10) |
+| `shopping_carts` | One row per customer | Gives the cart an identity apart from its contents |
+| `cart_items` | Product and quantity per cart | Unique on `(cart_id, product_id)`; adding again updates the quantity |
+| `orders` | Owner, `status`, `total_amount` | The durable record of a purchase |
+| `order_items` | Product, quantity, `unit_price` at order time | Later price changes never change what an order cost |
+| `payments` | Attempts per order, `status`, unique `payment_key` | An order can have several attempts (failed, then retried) |
 
-- `sessions.user_id → users.id` (`CASCADE`): a deleted user's sessions are meaningless and removed with them.
-- `products.seller_id → users.id` (`RESTRICT`): a user who owns products can't be hard-deleted, preventing orphaned catalog entries (users are deactivated via `is_active`, not deleted).
-- `products.category_id → categories.id` (`SET NULL`): deleting a category shouldn't cascade-delete every product in it; the product just becomes uncategorized.
-- `categories.parent_id → categories.id` (`SET NULL`): deleting a parent category promotes its children to top-level rather than deleting them.
-- `inventory.product_id → products.id` (`CASCADE`, `UNIQUE`): strict one-to-one — every product has exactly one inventory row, removed when the product is.
-- `shopping_carts.user_id → users.id` (`CASCADE`, `UNIQUE`): one cart per user, enforced at the schema level by the `UNIQUE` constraint (not just application logic).
-- `cart_items.(cart_id, product_id)` (`UNIQUE`): a product can only appear once per cart; adding it again should update `quantity`, not insert a second row.
-- `orders.user_id → users.id` (`RESTRICT`): order history must never disappear because a user record was removed.
-- `order_items.product_id → products.id` (`RESTRICT`): historical order lines must survive even if a product is later removed from the catalog.
-- `payments.order_id → orders.id` (`CASCADE`) / `payments.user_id → users.id` (`RESTRICT`): a payment has no meaning without its order, but must never silently vanish a user's payment history.
+All primary keys are UUIDs from `gen_random_uuid()`. Money is `numeric(10,2)`,
+converted to a JavaScript `number` at the service boundary.
+
+### Constraints the database enforces
+
+| Constraint | Protects against |
+| --- | --- |
+| `inventory.reserved_stock >= 0 AND reserved_stock <= total_stock` | Overselling or a double release, whichever code path causes it (§10) |
+| `inventory.total_stock >= 0` | Negative stock |
+| `inventory.product_id` unique | Two stock rows for one product |
+| `shopping_carts.user_id` unique | Two carts per customer, even under a race in `findOrCreateCart` |
+| `cart_items (cart_id, product_id)` unique | Duplicate lines |
+| `payments.payment_key` unique | Two payments from one idempotency key, even under a race (§11) |
+| `users.email`, `products.sku`, `categories.slug`, `sessions.refresh_token` unique | Duplicates; each unique constraint also creates the index used for lookups |
+| `price`, `unit_price`, `amount`, `total_amount >= 0`; `quantity > 0` | Nonsense values |
+
+Application checks are for good error messages. The constraints are for
+correctness when an application check is missing or racing.
+
+### Foreign keys and delete behaviour
+
+| Reference | On delete | Reason |
+| --- | --- | --- |
+| `sessions.user_id` | `CASCADE` | A session means nothing without its user |
+| `products.seller_id`, `orders.user_id`, `payments.user_id` | `RESTRICT` | Catalog and purchase history must not vanish with a user; users are deactivated with `is_active` instead |
+| `order_items.product_id` | `RESTRICT` | An order line must always resolve to its product; this is why products are soft deleted |
+| `products.category_id`, `categories.parent_id` | `SET NULL` | Removing a category orphans products and subcategories rather than deleting them |
+| `inventory.product_id`, `cart_items.*`, `order_items.order_id`, `payments.order_id` | `CASCADE` | Owned rows go with their owner |
 
 ### Indexes
 
-- `products.seller_id`, `products.category_id`: both are used to filter a seller's catalog or browse-by-category — the two most common product list queries.
-- `products.search_vector` (GIN): required for `tsvector @@ tsquery` full-text search to run in better than linear time.
-- `orders.user_id`: powers "my orders" lookups.
-- `orders.status`: powers admin/ops queries like "all pending orders."
-- `users.email`, `sessions.refresh_token`, `payments.payment_key`: **not** given a separate explicit index — each already has a `UNIQUE` constraint, and Postgres automatically creates a unique B-tree index to enforce it. Adding another index on the same column would be redundant and just cost extra write overhead.
+| Index | Serves |
+| --- | --- |
+| `products (seller_id)`, `products (category_id)` | A seller's catalog; browsing by category |
+| `products (search_vector)` GIN | `@@` full-text matching (§8) |
+| `orders (user_id)` | "My orders" |
+| `orders (status)` | Admin queries by status |
+| The unique constraints above | Login by email, lookup by SKU, slug, refresh token and payment key |
 
 ### Soft delete
 
-`products.is_deleted` is a boolean flag rather than an actual `DELETE`. Application code (added in a later step) will filter `WHERE is_deleted = false` on customer-facing reads. Nothing currently enforces this at the schema level (no view or RLS policy) — it's a convention services must follow — because enforcing it in the schema would block admin/reporting queries that legitimately need to see deleted products (e.g. for historical order line display, since `order_items.product_id` still points at it).
+Deleting a product sets `is_deleted = true`. Every customer-facing query repeats
+`is_deleted = false`; there is no view or row-level policy enforcing it. Order
+history still joins to the row, so an old order can still show its product's
+name.
 
-### Inventory reservation (schema-level)
+### Migrations and seed data
 
-`inventory` tracks `total_stock` and `reserved_stock` separately rather than decrementing `total_stock` directly on purchase:
+`node-pg-migrate` runs the ten files in `migrations/`, one per table, through
+`npm run migrate`. `npm run seed` is idempotent: every seeded row has a fixed
+UUID and every insert is `ON CONFLICT … DO NOTHING`. `npm run seed:fresh`
+truncates every table first. The seed contains three users (`admin@test.com`,
+`seller@test.com`, `customer@test.com`, password `Test@1234`), five categories
+and twenty products.
 
-- **Available stock** = `total_stock - reserved_stock` (computed by the application/queries, not a stored column).
-- A `CHECK (reserved_stock >= 0 AND reserved_stock <= total_stock)` constraint makes it impossible for reserved stock to exceed on-hand stock or go negative, regardless of which application code path updates it.
-- The intent (implemented in a later step, e.g. when carts/orders are wired up): placing an order increments `reserved_stock`; a completed/shipped order decrements both `total_stock` and `reserved_stock` together; a cancelled order or expired reservation decrements only `reserved_stock`. This lets multiple in-flight carts reserve stock without overselling, while the schema's `CHECK` constraint is the last line of defense against a bug reserving more than is on hand.
+---
 
-### Full-text search (tsvector)
+## 6. Request pipeline
 
-- `products.search_vector` is a plain `tsvector` column (not a `GENERATED ALWAYS AS` column) because the task called for trigger-based maintenance rather than a generated column — this also means backfills/reindexing can use a different `to_tsvector` config later without an `ALTER TABLE ... DROP EXPRESSION` migration.
-- `products_search_vector_update()` is a `plpgsql` trigger function that rebuilds the vector from `to_tsvector('english', name || ' ' || brand || ' ' || description)` (nulls coalesced to `''`).
-- `products_search_vector_trigger` fires `BEFORE INSERT OR UPDATE ... FOR EACH ROW`, so `search_vector` is always in sync — no application code has to remember to update it.
-- A GIN index on `search_vector` makes `WHERE search_vector @@ to_tsquery('english', '...')` queries fast (verified manually: inserting a product and querying `to_tsquery('english', 'wireless & mouse')` correctly matched).
+### Global middleware, in order
 
-### Seed credentials
+| # | Middleware | Why it is in this position |
+| --- | --- | --- |
+| 1 | `requestIdMiddleware` | First, so every later log line, including errors, carries the id (§13) |
+| 2 | `helmet()` | Security headers on every response, errors included |
+| 3 | `cors()` | Default settings allow every origin |
+| 4 | `express.json()` | Parses the body before validation needs it |
+| 5 | `requestLogger` | Measures time from here to `finish` |
+| 6 | `metricsMiddleware` | Same, for Prometheus |
+| — | `/health`, `/metrics`, `/api-docs`, `/api/v1/*` | Routes |
+| last | `errorHandler` | Four-argument middleware, reached by `next(error)` |
 
-| Role | Email | Password |
-|---|---|---|
-| Admin | `admin@test.com` | `Test@1234` |
-| Seller | `seller@test.com` | `Test@1234` |
-| Customer | `customer@test.com` | `Test@1234` |
-
-All three share the same bcrypt hash of `Test@1234` (cost factor 10). `npm run seed` is safe to run repeatedly (every insert targets the row's natural unique key with `ON CONFLICT ... DO NOTHING`); `npm run seed:fresh` truncates all 10 tables (`CASCADE`) and reseeds from scratch. Every seeded row uses a deterministic, hardcoded UUID (grouped by table, e.g. all user ids start `00000001-...`) rather than `gen_random_uuid()`, which is what makes reruns idempotent instead of merely conflict-free.
-
-## Step 3 - Auth & RBAC
-
-### Access vs. refresh token strategy
-
-Two tokens with very different shapes, on purpose:
-
-- **Access token** — a signed JWT (`jsonwebtoken`, `HS256` via `env.jwtSecret`) carrying `{ userId, email, role }`, expiring after 15 minutes (`JWT_EXPIRES_IN`). It's stateless: `authenticateToken` only has to verify the signature and expiry, with no database round-trip, which is what makes it cheap to check on every request.
-- **Refresh token** — an opaque random string (`crypto.randomBytes(64).toString('hex')`, *not* a JWT), stored server-side in `sessions` (`user_id`, `refresh_token`, `expires_at`), expiring after 7 days (`JWT_REFRESH_EXPIRES_IN`). Because it's just a row in the database, it can be revoked instantly (delete the row) — something a stateless JWT refresh token could not do without an extra denylist.
-
-The short-lived stateless token keeps the hot path (every authenticated request) fast and DB-free; the long-lived stateful token keeps the sensitive, infrequent path (getting a new access token) revocable. Neither token alone gives both properties — that's the reason for two.
-
-### Token rotation flow
-
-`POST /api/v1/auth/refresh` with `{ refreshToken }`:
-
-1. Look up `sessions WHERE refresh_token = $1`. Not found → `401 Invalid refresh token`.
-2. Check `session.expires_at` against `now()`. Expired → delete the row anyway (cleanup) and return `401 Refresh token expired`.
-3. Load the owning user. Missing or `is_active = false` → delete the session and return `401 User no longer active`.
-4. **Delete the old session row unconditionally** before issuing anything new — this is the "rotate" step: the old refresh token becomes unusable the instant it's used, whether or not the request as a whole succeeds past this point.
-5. Issue a brand new access token + a brand new opaque refresh token, insert the new session row, return both to the client.
-
-Practical effect: a refresh token is single-use. If it's ever replayed (e.g. stolen and used by an attacker after the legitimate client already rotated it), the second use simply 401s because the row is already gone — the same mechanism that enables rotation also limits the blast radius of a leaked refresh token to a single use.
-
-### RBAC middleware chain
-
-Two independent, composable middlewares, applied in sequence on a route:
+### Per-route chain
 
 ```
-router.get('/some-protected-route', authenticateToken, requireRole('seller', 'admin'), controller.handler);
+  authenticateToken  ->  requireRole(...)  ->  validateParams / validateBody / validateQuery  ->  controller
+       401                   403                              422                              2xx / AppError
 ```
 
-- **`authenticateToken`**: reads `Authorization: Bearer <token>`, `jwt.verify`s it against `env.jwtSecret`, and on success attaches the decoded payload to `req.user` (typed as `AccessTokenPayload`). Missing header, malformed token, bad signature, or expiry all produce the same `401` — the client can't distinguish "no token" from "bad token" from "expired token," which avoids leaking which case applies.
-- **`requireRole(...roles)`**: a factory, not a middleware itself — calling it with a list of allowed roles (e.g. `requireRole('admin')`) returns a middleware that checks `req.user.role` against that list, responding `403` if `req.user` is missing (i.e. `authenticateToken` wasn't run first, or somehow didn't attach a user) or its role isn't allowed.
+Authentication runs before validation, so an anonymous caller learns nothing
+about the shape of a request it may not make. On `/auth/login` and
+`/auth/register` the rate limiter runs before validation, so malformed bodies
+count against the limit too (§7).
 
-Splitting these two concerns (authentication vs. authorization) means a route can require login without restricting role (`authenticateToken` alone, as `GET /me` does), or chain both when only specific roles should reach a handler. No route in Step 3 uses `requireRole` yet — the endpoints seeded here (register/login/refresh/logout/me) are either public or "any authenticated user"; role-gated business endpoints (e.g. only sellers creating products) are wired starting Step 4, reusing this same middleware unchanged.
+### Validation
 
-### Redis sliding-window rate limiting
+`zod` schemas live next to each module. A failure returns `422` with
+`error.flatten()`, which lists problems per field. On success:
 
-`src/middleware/rateLimiter.ts` implements a true sliding window (not fixed-window buckets) using one Redis **sorted set** per `(route, IP)`, where each member's score is the request's timestamp in milliseconds:
+- `validateBody` replaces `req.body` with the parsed value, so defaults (for example `role: 'customer'`) and coercions are applied before the controller runs.
+- `validateQuery` stores the parsed query, with numbers coerced and defaults applied, in `res.locals.query`, where controllers read it. `req.query` keeps the raw strings.
+- `validateParams` only checks. Every path id must be a UUID, so a malformed id is a `422`, not a Postgres cast error.
 
-1. `ZREMRANGEBYSCORE key 0 (now - windowMs)` — prune every entry older than the window; this is what makes it "sliding" rather than resetting on a clock boundary.
-2. `ZCARD key` — count what's left (i.e. requests within the last `windowMs`).
-3. If `count >= max`: read the oldest surviving entry (`ZRANGE key 0 0 WITHSCORES`) to compute exactly when it will age out (`oldestTimestamp + windowMs - now`), set that as the `Retry-After` header (in seconds), and respond `429`.
-4. Otherwise: `ZADD key now <unique-member>` to record this request, `PEXPIRE key windowMs` so an abandoned key cleans itself up, and call `next()`.
+Sort columns come from a fixed map (`price` → `p.price`), never from input.
+Every value reaches SQL as a `$n` parameter.
 
-The member string (`${now}-${random}`) is unique per request even when two requests land in the same millisecond, since sorted set members must be unique — using a bare timestamp as the member would silently collide and undercount. Applied via `rateLimit({ windowMs, max, keyPrefix })`:
+### Errors
 
-- `login`: 5 requests / 15 minutes / IP.
-- `register`: 10 requests / hour / IP.
+Services throw `AppError(status, message)`. Controllers wrap every call in
+`try { … } catch (error) { next(error) }`. `errorHandler`:
 
-Both limiters count *every* request that reaches the route (successes, wrong-password 401s, and validation 400s alike), because the limiter middleware runs before Zod validation — rate limiting only the "invalid" requests would let an attacker bypass it by sending malformed bodies.
+- uses `err.statusCode`, or `500` if there is none;
+- logs every error with its stack, method and path;
+- in production, replaces the message of a `500` with `Internal server error` and omits every stack; outside production, returns both.
 
-### Security decisions
+### Status codes used
 
-- **bcrypt cost factor 12** for password hashing — higher than the library default (10) to raise the cost of offline brute-forcing if the `users` table were ever exfiltrated, while still completing in well under 100ms on typical hardware.
-- **Access tokens are short-lived (15 min)** specifically so that a leaked access token has a small, fixed window of usefulness, without requiring any server-side revocation mechanism for them.
-- **Refresh tokens are opaque, not JWTs** — see "Access vs. refresh token strategy" above; this is what makes instant revocation (logout, rotation) possible.
-- **Registration accepts `role` directly from the request body** (defaulting to `customer`) as specified — meaning any caller can currently self-register as `seller` or even `admin`. This is a known, deliberate simplification for this stage of the project (there's no invite/approval flow yet); it should be revisited before this API is exposed publicly (e.g. requiring an existing admin to grant the `seller`/`admin` role instead of trusting client input).
-- **`helmet()`** is applied globally and first in the middleware chain, adding the standard protective headers (`Content-Security-Policy`, `X-Content-Type-Options: nosniff`, `X-Frame-Options`, `Strict-Transport-Security`, etc.) to every response, auth-related or not.
-- **`cors()`** is applied with its permissive defaults (reflects any origin) — appropriate for this stage of development; will need an explicit allow-list once there's a known frontend origin to restrict to.
-- **Generic auth error messages**: login failures always say "Invalid email or password" regardless of whether the email exists, and `authenticateToken` always says "Invalid or expired access token" regardless of which check failed — both deliberately avoid confirming to an attacker which half of a guess was correct.
+| Code | Meaning here |
+| --- | --- |
+| `200`, `201`, `204` | Success; `201` for creation; `204` for a soft delete and for clearing the cart |
+| `400` | A business rule refused the request: empty cart, insufficient stock, illegal status change |
+| `401` | Missing or invalid access token; bad credentials; bad refresh token |
+| `402` | Simulated payment failure |
+| `403` | Wrong role, or not the owner of the resource |
+| `404` | Missing resource |
+| `409` | Duplicate email or SKU; a payment key reused for a different order |
+| `422` | Input failed schema validation |
+| `429` | Rate limited, with `Retry-After` |
 
-### `req.user` typing
+---
 
-`src/types/express.d.ts` uses TypeScript's global augmentation to add `user?: AccessTokenPayload` to Express's own `Request` interface:
+## 7. Authentication and authorization
 
-```ts
-declare global {
-  namespace Express {
-    interface Request {
-      user?: AccessTokenPayload;
-    }
-  }
-}
+### Two tokens
+
+| | Access token | Refresh token |
+| --- | --- | --- |
+| Form | JWT, HS256, `{ userId, email, role }` | 64 random bytes, hex encoded; opaque |
+| Lifetime | `JWT_EXPIRES_IN`, default 15 minutes | `JWT_REFRESH_EXPIRES_IN`, default 7 days |
+| Stored on the server | no | yes, a row in `sessions` |
+| Checked by | signature and expiry only; no database read | a database lookup |
+| Revocable | no; it expires | yes; delete the row |
+
+The access token is checked on every authenticated request, so it has to be
+cheap. The refresh token is used rarely and is the long-lived credential, so it
+has to be revocable. Neither kind of token gives both properties alone.
+
+The cost of a stateless access token: a role change or `is_active = false` does
+not affect tokens already issued. They keep working for up to 15 minutes.
+
+### Rotation
+
+```
+  POST /auth/refresh { refreshToken }
+  1. DELETE FROM sessions WHERE refresh_token = $1
+     RETURNING user_id, expires_at      no row  -> 401 Invalid refresh token
+  2. expires_at < now                   -> 401 Refresh token expired
+  3. load user                          missing or inactive -> 401 User no longer active
+  4. issue a new access token and a new refresh token; INSERT the new session
 ```
 
-Because this merges into the `Express` namespace globally, every `Request` throughout the app — in any controller, any middleware, any module, without a single extra import — has `req.user` available and correctly typed as `AccessTokenPayload | undefined`, with no casting required. `authenticateToken` is the only place that assigns it; every other consumer (`requireRole`, `authController.me`) only reads it, and the `| undefined` in the type forces every reader to handle the "not authenticated" case rather than assuming a value is always present.
+Each refresh token works once. The session is consumed by one atomic `DELETE`,
+so of two refreshes with the same token, even concurrent ones, exactly one gets
+the row back; the other, and any later replay, gets a `401`. Every failure path
+after step 1 would have deleted the session anyway, so deleting first loses
+nothing.
 
-## Step 4 - Products, Inventory & Search
+### Roles
 
-### Full-text search with `plainto_tsquery`
+`authenticateToken` puts the verified payload on `req.user`. Its type comes
+from a global augmentation of Express's `Request` in `src/types/express.d.ts`,
+so it is available everywhere as `AccessTokenPayload | undefined`.
+`requireRole(...roles)` is a factory that returns middleware checking
+`req.user.role`.
 
-`products.search_vector` (populated by the `BEFORE INSERT OR UPDATE` trigger from Step 2) is a `tsvector` built from `name`, `brand`, and `description`. The search endpoint matches it with:
+| Endpoint group | Roles |
+| --- | --- |
+| `GET /products`, `GET /products/:id`, `GET /search` | public |
+| `POST`, `PUT`, `DELETE /products` | `seller`, and only their own products |
+| `PUT /inventory/:productId`, `GET /inventory/low-stock` | `seller` (own products) or `admin` |
+| `/cart/*` | `customer` |
+| `POST /orders`, `PUT /orders/:id/cancel` | `customer` (own orders) |
+| `GET /orders`, `GET /orders/:id` | any role; non-admins see only their own orders |
+| `PUT /orders/:id/status` | `admin` |
+| `POST /payments/initiate`, `/process/:id` | `customer` (own orders and payments) |
+| `POST /payments/refund/:id` | `admin` |
+
+Roles are checked in middleware. Ownership is checked in services, because it
+needs the resource's row: `403 You do not own this product` or
+`… this order`.
+
+### Rate limiting
+
+A sliding window per route and IP, in one Redis sorted set whose scores are
+millisecond timestamps. The steps run as one Lua script (`EVAL`):
+
+```
+  key = ratelimit:<route>:<ip>
+  1. ZREMRANGEBYSCORE key 0 (now - window)     drop entries older than the window
+  2. ZCARD key                                 requests still inside it
+  3. count >= max  ->  return the oldest entry's timestamp
+                       429, Retry-After = oldest entry + window - now
+  4. otherwise     ->  ZADD key now "<now>-<random>";  PEXPIRE key window; return -1
+```
+
+| Route | Limit |
+| --- | --- |
+| `POST /auth/login` | 5 per 15 minutes per IP |
+| `POST /auth/register` | 10 per hour per IP |
+
+- **Sliding, not fixed.** A fixed window lets a client send `2 × max` requests across a boundary. Pruning by score makes the window always the last N minutes.
+- **The member is unique per request.** Two requests in the same millisecond would otherwise collapse into one member and be undercounted.
+- **It is atomic.** Redis runs a script without interleaving other commands. As four separate round trips, a burst of concurrent requests could all read a count below the limit and all be admitted; a test sends 15 simultaneous logins and requires exactly 5 through. `MULTI` would not be enough, because step 4 depends on the result of step 2.
+- **It counts every request**, successful or not.
+
+### Other security decisions
+
+| Decision | Reason |
+| --- | --- |
+| bcrypt cost 12 | Slows offline guessing if `users` leaks |
+| The same `401 Invalid email or password` for an unknown email, a wrong password or an inactive account | Does not confirm which part was wrong |
+| Registration accepts `role` from the body | A known shortcut; anyone can register as `admin` (§17) |
+| Refresh tokens stored in plain text | A leaked `sessions` table would expose live tokens; hashing them is listed in §18 |
+| `JWT_SECRET` falls back to `change-me`, except in production | Convenient locally; with `NODE_ENV=production` and no secret, `config/env.ts` throws at startup rather than sign forgeable tokens |
+
+---
+
+## 8. Catalog and search
+
+### Products
+
+| Operation | Behaviour |
+| --- | --- |
+| Create | One transaction inserts the product and its `inventory` row (stock 0, threshold 10), so a product never exists without stock data; a duplicate SKU is `409` |
+| Update | Owner only; builds `SET` from the fields present; publishes `product.updated` |
+| Delete | Owner only; soft delete |
+| List | Paginated by `page` and `limit` (at most 100), newest first; not cached |
+| Get | Cache-aside through Redis (§9) |
+
+Every read that returns a product uses the same `PRODUCT_SELECT` (products
+joined to category, seller and inventory) and the same `toPublicProduct`
+mapper. `availableStock = total_stock - reserved_stock` is computed on read and
+never stored.
+
+### Full-text search
+
+`products.search_vector` is a `tsvector` kept current by a `BEFORE INSERT OR
+UPDATE` trigger:
 
 ```sql
-WHERE p.search_vector @@ plainto_tsquery('english', $q)
+NEW.search_vector := to_tsvector('english',
+  coalesce(NEW.name, '') || ' ' || coalesce(NEW.brand, '') || ' ' || coalesce(NEW.description, ''));
 ```
 
-`plainto_tsquery` (rather than `to_tsquery` or `websearch_to_tsquery`) was chosen specifically because it takes plain, unstructured user input — spaces, punctuation, anything a search box might receive — and turns it into an `AND`-of-lexemes query without the caller needing to know `tsquery` operator syntax (`&`, `|`, `!`, `<->`). `to_tsquery` would throw a syntax error on input like `"wireless mouse!"`; `plainto_tsquery` just tokenizes, stems (`'english'` config), and ANDs the terms together. The `@@` operator is what the GIN index on `search_vector` (from Step 2) actually accelerates — without it, this would be a sequential scan with a stemming function call per row.
+A trigger rather than application code means no write path can forget it. A
+GIN index makes `@@` matching an index lookup instead of a scan.
 
-`category`, `minPrice`/`maxPrice`, and `brand` are plain `WHERE` clauses layered on top with `AND` — they narrow the same result set the tsvector match produces, they don't participate in ranking (no `ts_rank` is used; results are explicitly sorted by `sortBy`/`sortOrder` instead, which the task called for over relevance ranking).
+`GET /search` builds a `WHERE` clause from whatever filters are present:
 
-### Redis cache-aside pattern
+| Parameter | SQL |
+| --- | --- |
+| `q` | `p.search_vector @@ plainto_tsquery('english', $n)` |
+| `category` | `c.slug = $n` |
+| `minPrice`, `maxPrice` | `p.price >= $n`, `p.price <= $n` |
+| `brand` | `p.brand ILIKE $n`, a case-insensitive exact match |
+| always | `p.is_deleted = false` |
+| `sortBy`, `sortOrder` | `price` or `created_at`, `asc` or `desc`; default `created_at desc` |
 
-Both `GET /products/:id` and `GET /search` follow the same shape:
+**Why `plainto_tsquery`.** It accepts any text a search box produces, stems it
+with the English configuration and ANDs the terms together. `to_tsquery` would
+fail on input such as `wireless mouse!`, because it expects operator syntax.
 
-1. Compute a deterministic cache key from the request (`product:{id}`, or `search:{md5(canonical query)}`).
-2. `GET` that key from Redis. Hit → parse and return the cached JSON directly, no database query at all.
-3. Miss → run the real Postgres query, build the response, `SET` it into Redis with an `EX` TTL, then return it.
+A search runs two queries, a `COUNT(*)` and the page, so the response can report
+`total` and `totalPages`.
 
-This is why `PublicProduct.createdAt`/`updatedAt` are typed and stored as ISO **strings**, not `Date` objects: a cache hit returns whatever was `JSON.parse`'d back out of Redis, and a cache miss returns whatever was just built from a fresh DB row. Serializing dates to strings before caching means both paths produce byte-identical shapes — a consumer of this API can't tell, and doesn't need to care, whether a given response came from Postgres or from Redis.
+### Inventory endpoints
 
-The search cache key is built by taking the *validated* query object (after Zod has applied defaults, e.g. `page=1` when omitted) and running `JSON.stringify(query, Object.keys(query).sort())` before hashing with MD5. Passing the sorted key list as `JSON.stringify`'s replacer argument forces a canonical key order regardless of how the client wrote the query string — `?q=mouse&page=1` and `?page=1&q=mouse` hash to the same cache key, and an unspecified `sortOrder` (defaulted by Zod) doesn't produce a different key than one written explicitly.
+- `PUT /inventory/:productId { totalStock }` sets on-hand stock. The `CHECK` constraint rejects a value below `reserved_stock`. If the result leaves `available <= low_stock_threshold`, it publishes `inventory.updated` with the full snapshot, so a consumer does not need to query again.
+- `GET /inventory/low-stock` lists products at or below their threshold, most urgent first; a seller sees only their own.
 
-### Cache invalidation strategy
+Only the explicit stock update checks the threshold. Checkout lowering
+available stock does not publish `inventory.updated`.
 
-- `product:{id}` is deleted directly (single-key `DEL`) whenever that specific product changes: on `PUT`, on soft-`DELETE`, and on an inventory stock update (stock feeds into that product's cached `availableStock`).
-- **Every** `search:*` key is deleted — not just keys that might contain the affected product — on product create, product update, soft delete, and inventory update. This is `deleteKeysByPattern('search:*')` in `src/config/redis.ts`, a non-blocking `SCAN`/`MATCH`/`DEL` loop (chosen over the simpler but blocking `KEYS` command, which would stall the single-threaded Redis server for the duration of the scan on a larger keyspace).
-- The reason it's "delete everything matching `search:*`" rather than "figure out which cached searches contain this product": a cached search result is a full page of products plus a total count, produced by an arbitrary combination of `q`/`category`/`price range`/`brand`/`sort`/`page`. There is no cheap way to know, after the fact, which of those cached combinations a single changed product would have appeared in (or affected the `total` count of) without re-running every cached query — which defeats the purpose of caching. Given the search cache's short 5-minute TTL and that writes (create/update/delete) are comparatively rare next to reads, blanket invalidation trades a brief cache-cold period after any write for correctness, which is the right tradeoff here: serving stale search results (an out-of-stock item still listed, a changed price) is a worse failure mode than a few extra cache misses.
+---
 
-### Available stock and `reserved_stock`
+## 9. Caching
 
-`availableStock` in every product response is computed as `total_stock - reserved_stock`, always at read time (it is never itself stored) — `total_stock` and `reserved_stock` are the columns that change; `availableStock` is a derived view over them.
+### Pattern
 
-`reserved_stock` exists as a separate column (rather than decrementing `total_stock` directly whenever something is purchased) because a purchase is a multi-step process — item added to cart, checked out, payment pending, payment confirmed — and stock has to be held for a customer partway through that process without yet being permanently subtracted from what's physically on hand. Step 2's schema already anticipated this: a `CHECK (reserved_stock >= 0 AND reserved_stock <= total_stock)` constraint prevents reserved stock from ever exceeding on-hand stock, no matter which code path updates it. This step only wires up the read side (`availableStock`) and the seller/admin-facing `total_stock` update; the reservation lifecycle itself (incrementing `reserved_stock` on order placement, decrementing both together on fulfillment) is Step 5's concern (Cart, Orders, Payments), once there's an order flow to drive it.
-
-### Soft delete enforcement
-
-Every product-reading query in this step — `listProducts`, `getProductById`, `findOwnableProduct` (used by update/delete ownership checks), the search query, and the inventory low-stock query — includes `p.is_deleted = false` (or, for `findOwnableProduct`, is used specifically so a soft-deleted product can no longer be updated/deleted at all, returning `404` as if it didn't exist). There's no single shared query builder enforcing this centrally; instead every hand-written SQL statement that touches `products` repeats the same literal condition. The `product:{id}` and `search:*` Redis caches only ever get populated from these already-filtered queries, so a soft-deleted product also can't "leak" back into visibility through the cache — but only because delete also explicitly invalidates both caches (see "Cache invalidation strategy" above); without that, a deleted product already sitting in cache could keep being served as available for up to its remaining TTL.
-
-### Kafka producer setup and `publishEvent`
-
-`src/config/kafka.ts` constructs a single `kafkajs` `Producer` at module load (`kafka.producer({ createPartitioner: Partitioners.DefaultPartitioner })`) but does **not** connect immediately — constructing a `Kafka`/`Producer` instance doesn't open a socket, so importing this module (transitively, via `app.ts` → the products/inventory routes) has no side effect and can't leave an open handle in, say, a test run that never actually publishes anything.
-
-`publishEvent(topic, payload)` is the only way the rest of the app talks to Kafka:
-
-1. Lazily connects the producer on first call (`ensureConnected()`, a one-time `producer.connect()` guarded by a module-level `connected` flag).
-2. `JSON.stringify`s the payload and sends it as a single message to `topic`.
-3. Catches and **logs** (via the existing Winston logger) rather than rethrows any failure.
-
-That third point is deliberate: publishing `product.updated`/`inventory.updated` is a side effect of a successful database write, not a precondition for the client's request to succeed. If Kafka is briefly unreachable, a seller updating their product price should still get their `200 OK` — losing an event to a transient broker outage is an acceptable tradeoff for this system's current scope (there's no outbox pattern / guaranteed-delivery requirement yet), versus failing an otherwise-successful product update because a downstream system happened to be down.
-
-Two topics are published today, both from service methods after their triggering write has already committed:
-- `product.updated` — from `ProductsService.updateProduct`, `{ productId, sellerId, updatedAt }`.
-- `inventory.updated` — from `InventoryService.updateStock`, but **only** when the update leaves `available_stock <= low_stock_threshold`; it carries the full stock snapshot (`{ productId, totalStock, reservedStock, availableStock, lowStockThreshold }`) so a consumer doesn't need to re-query the product to decide whether to act (e.g. notify the seller, trigger reordering).
-
-Verified against a real local Kafka broker (KRaft mode, no ZooKeeper) with a `kafka-console-consumer` running against both topics: updating a product produced exactly one `product.updated` message with the expected fields; dropping a product's stock to or below its threshold produced an `inventory.updated` message, while a stock update that stayed above the threshold correctly produced none.
-
-## Step 5 - Cart, Orders, Payments & Kafka
-
-### Order placement transaction, step by step
-
-`OrdersService.placeOrder` runs as a single `pg` client transaction (one connection, explicit `BEGIN`/`COMMIT`/`ROLLBACK` — not `pool.query`, which would use a different connection per call and couldn't share a transaction):
-
-1. **`BEGIN`.**
-2. **Find the customer's cart.** No cart row → `400 Cart is empty`. This has to come before anything else touches inventory: there's nothing to reserve stock for yet.
-3. **Read and lock every cart item's product + inventory row (`SELECT ... FOR UPDATE OF i`).** The lock is taken here, before any validation, because validation itself ("is there enough stock?") is only meaningful against a row nobody else can concurrently change out from under it. Locking after validating would defeat the point — a second transaction could slip in between the check and the lock.
-4. **Validate every item:** `is_available` and `quantity <= available_stock` (`total_stock - reserved_stock`, read from the just-locked rows). Any single item failing throws immediately, which unwinds to the `catch` block and rolls back — so a cart with 3 valid items and 1 invalid one reserves nothing for the 3 valid ones either. All-or-nothing was chosen over "reserve what you can" because a partially-fulfilled order is a worse customer experience than a clear "your order couldn't be placed" — and it's what makes the rest of the transaction (a single order with a single consistent total) meaningful.
-5. **Reserve stock**: `UPDATE inventory SET reserved_stock = reserved_stock + quantity` for each item, while still holding the locks from step 3. This is safe precisely because of that lock — no other transaction can be mid-read of the same inventory rows right now.
-6. **Insert the order** (`status = 'pending'`, `total_amount` computed from the locked items' prices — never from client input).
-7. **Insert `order_items`**, one row per cart item, snapshotting `unit_price` at order time (so a later price change on the product never retroactively changes what this order billed).
-8. **Delete the cart's `cart_items`.** The cart is now "spent" — its contents have become an order.
-9. **`COMMIT`.**
-10. *(Outside the transaction, after commit)* invalidate the affected products' `product:{id}`/`search:*` caches (reservation changed `availableStock`), then `publishEvent('order.created', ...)`.
-
-**Deliberate deviation from the task's literal step numbering**: the task listed "7. Publish order.created ... 8. COMMIT" — publish *before* commit. This implementation commits first, then publishes. Publishing before a commit that might still fail (rare, but possible — e.g. a connection drop right before `COMMIT` lands) would mean announcing an order to every Kafka consumer (including the audit log) that doesn't actually exist in the database once the dust settles. Since `publishEvent` never throws (Step 4), there's no correctness reason to publish early, and committing first guarantees every `order.created` event corresponds to a real, durable order.
-
-### Why `reserved_stock` instead of decrementing `total_stock` immediately
-
-This was already set up schema-wise in Step 2 and used read-only in Step 4; Step 5 is where it actually gets exercised end-to-end. The short version: **placing an order is not the same moment as the stock physically leaving the warehouse.** Between "order placed" and "order delivered," a customer can cancel, a payment can fail, an admin can refund — all of which need to give the stock back. If `total_stock` were decremented at order time, "giving it back" would mean incrementing `total_stock` again, which is indistinguishable from *new* stock arriving — there'd be no way to tell "this unit came back because an order was cancelled" from "the seller restocked." Keeping a separate `reserved_stock` counter means:
-
-- `total_stock` only ever changes when stock actually, physically changes (seller restocks it, or an order is `delivered` and the unit is genuinely gone).
-- `reserved_stock` tracks "spoken for but not yet gone" — incremented on order placement, decremented on cancel/refund, and **converted** into a `total_stock` decrease (both drop together) only at `delivered`, the one point where reservation becomes physical fact.
-- `availableStock = total_stock - reserved_stock` is always derivable and never needs its own column or its own invalidation logic beyond the two inputs it's built from.
-
-### Idempotent payment key pattern
-
-`payment_key` is a caller-supplied idempotency token (not server-generated) with a `UNIQUE` constraint backing it since Step 2. `POST /payments/initiate` always checks for an existing row with that key *before* creating anything:
-
-- **First call**, `paymentKey = "abc"`: no existing row → validates the order, inserts a new `pending` payment, returns it with `201`.
-- **Retry** (e.g. the client's HTTP response was lost to a network blip, so it retries the exact same request with the exact same `paymentKey = "abc"`): existing row found → returned as-is with `200`. No second payment row, no double-charge risk, no error — the retry is indistinguishable in effect from the request having simply taken a bit longer.
-- **Race** (two requests with a brand-new key arrive close enough together that both pass the "no existing row" check before either inserts): the second `INSERT` hits the `UNIQUE` constraint and fails; the `catch` block detects the Postgres unique-violation code and re-reads the row the *other* request just inserted, returning that instead of propagating a `500`. The database's own constraint is the actual source of truth for uniqueness; the earlier `SELECT` is just an optimization to skip the round-trip in the common (non-racing) case.
-
-This is why `amount` on the payment is always derived from `orders.total_amount` server-side rather than accepted from the request body: the whole point of an idempotency key is that retrying is safe *because* retrying can't change what actually happens — that guarantee breaks if a client could smuggle in a different amount on a "retry."
-
-### Order status lifecycle
+Cache-aside: the service reads Redis first and falls back to Postgres.
 
 ```
-pending → confirmed → shipped → delivered
-   ↓           ↓
-cancelled   cancelled
+  getProductById(id)
+  1. GET product:{id}            hit  -> JSON.parse, cache_hits_total++, return
+  2. cache_misses_total++
+  3. SELECT ... WHERE p.id = $1 AND p.is_deleted = false     missing -> 404 (not cached)
+  4. SET product:{id} <json> EX 600
+  5. return
 ```
 
-- **`pending`**: set by `placeOrder`. Stock is reserved; nothing has been paid yet.
-- **`pending → confirmed`**: triggered by `PaymentsService.process` succeeding (the mocked 90% path) — *not* by the admin status endpoint. A payment completing is what confirms an order; there's no other way to reach `confirmed`.
-- **`confirmed → shipped`**, **`shipped → delivered`**: triggered only by an admin calling `PUT /orders/:id/status`. `ALLOWED_TRANSITIONS` is a strict one-step lookup table (`{ pending: 'confirmed', confirmed: 'shipped', shipped: 'delivered' }`); any requested status that isn't exactly the current status's single allowed successor is rejected with `400` — so `pending → shipped` or `confirmed → confirmed` both fail, not just the "backwards" transitions.
-- **`delivered`**: the terminal success state. This is the one status change with an extra side effect — `total_stock` and `reserved_stock` both decrement together, because this is the moment a reservation becomes a permanent, physical stock reduction.
-- **`pending`/`confirmed → cancelled`**: triggered by the customer calling `PUT /orders/:id/cancel` (only legal from these two statuses — once `shipped`, the physical item is already in transit and cancelling stops making sense as a simple stock-release operation) or by an admin refunding a `completed` payment (`PaymentsService.refund`, which cancels the order as part of the same transaction as the refund).
-- **`cancelled`** and **`delivered`** are both terminal — nothing in this codebase transitions an order out of either.
+| Key | Value | TTL | Filled by |
+| --- | --- | --- | --- |
+| `product:{id}` | One `PublicProduct` | 600 s | `GET /products/:id` |
+| `search:{md5}` | One page of results plus pagination | 300 s | `GET /search` |
+| `ratelimit:{route}:{ip}` | Sorted set of timestamps | the window | Rate limiter (§7) |
+| `order:stock-released:{orderId}` | `1`, a claim flag | 7 days | Cancellation (§12) |
 
-### How `ROLLBACK` works when something fails mid-transaction
+**Search keys are canonical.** The key hashes the validated query after zod has
+applied defaults, serialised with sorted keys:
+`JSON.stringify(query, Object.keys(query).sort())`. `?q=mouse&page=1` and
+`?page=1&q=mouse`, or an omitted `sortOrder` and an explicit `desc`, map to one
+key.
 
-Every multi-statement write in this step (`placeOrder`, `cancelOrder`, `updateStatus`, the success path of `process`, `refund`) follows the same shape:
+**Dates are cached as strings.** `toPublicProduct` converts `Date` to ISO
+strings before caching, so a hit and a miss return identical JSON.
+
+### Invalidation
+
+| Write | Deletes `product:{id}` | Deletes all `search:*` |
+| --- | --- | --- |
+| Create product | — | yes |
+| Update product | yes | yes |
+| Delete product | yes | yes |
+| Set stock | yes | yes |
+| Place order (reserves stock) | each product in the order | yes |
+| Cancel order, refund (releases stock) | each product in the order | yes |
+| Deliver order (removes stock) | each product in the order | yes |
+| `InventoryConsumer` release | each product in the event | yes |
+
+**Why every search key.** A cached page is the result of an arbitrary mix of
+text, category, price range, brand, sort and page. Working out which cached
+pages one changed product appears in, or changes the `total` of, would mean
+re-running each query, which is the cost the cache exists to avoid. Writes are
+rare compared with reads, so a brief cold search cache after each write is the
+cheaper price for never showing a stale price or stock count.
+
+**How.** `deleteKeysByPattern` iterates with `SCAN … MATCH search:* COUNT 100`
+and deletes each batch. `KEYS` would block Redis, which is single-threaded, for
+the whole scan. The cost is still proportional to the whole keyspace, not to the
+matching keys, and it is paid on every order (§16).
+
+### What the cache does not guarantee
+
+- **A read racing a write can re-cache old data.** A miss reads the old row; the write commits and deletes the key; the miss then writes the old value back. It stays until the TTL expires. The window is one database round trip wide.
+- **Redis is on the request path.** A cache read that fails is not caught, so the request fails instead of falling back to Postgres (§17).
+- **Cache writes after commit can fail** after the database change has already committed. The client then gets a `500` for a write that took effect (§17).
+
+---
+
+## 10. Checkout and inventory concurrency
+
+### Reserved stock
+
+```
+  inventory row          total_stock = 10   reserved_stock = 3   available = 7
+                         ^^^^^^^^^^^^^^^^   ^^^^^^^^^^^^^^^^^^
+                         physically held    promised to open orders
+```
+
+| Event | `total_stock` | `reserved_stock` |
+| --- | --- | --- |
+| Order placed | — | `+ quantity` |
+| Order cancelled or refunded | — | `− quantity` |
+| Order delivered | `− quantity` | `− quantity` |
+| Seller sets stock | `= value` | — |
+
+Placing an order is not the moment stock leaves the warehouse. The order can
+still be cancelled, the payment can fail, an admin can refund. If checkout
+decremented `total_stock` directly, giving stock back would look exactly like
+restocking. Keeping reservations separate makes `total_stock` change only when
+physical stock changes, and makes `available` derivable from two columns.
+
+### The transaction
+
+`OrdersService.placeOrder` holds one pooled connection for the whole
+transaction. `pool.query` would use any free connection for each statement, so
+statements could not share a transaction.
+
+```
+  BEGIN
+  1. SELECT id FROM shopping_carts WHERE user_id = $1 FOR UPDATE    lock the cart; no cart -> 400
+  2. SELECT ci.product_id, ci.quantity, p.price, p.is_available, p.is_deleted,
+            i.total_stock - i.reserved_stock AS available_stock
+     FROM cart_items ci
+     JOIN products  p ON p.id = ci.product_id
+     JOIN inventory i ON i.product_id = p.id
+     WHERE ci.cart_id = $1
+     ORDER BY ci.product_id
+     FOR UPDATE OF i                                                 lock every inventory row
+                                                                     no rows -> 400 Cart is empty
+  3. every line: not deleted, is_available,
+     and quantity <= available_stock                                 any failure -> 400, ROLLBACK
+  4. UPDATE inventory i SET reserved_stock = i.reserved_stock + u.quantity
+     FROM unnest($1::uuid[], $2::int[]) AS u(product_id, quantity)
+     WHERE i.product_id = u.product_id                               one statement for all lines
+  5. INSERT INTO orders (user_id, 'pending', total)                  total from locked prices
+  6. INSERT INTO order_items SELECT ... FROM unnest(...)             unit_price snapshot
+  7. DELETE FROM cart_items WHERE cart_id = $1
+  COMMIT
+  --- after commit ---
+  8. invalidate product:{id} for each line, and search:*
+  9. publish order.created
+  10. read the order back and return it
+```
+
+**Lock before checking.** The stock check in step 3 is meaningful only against
+rows nobody else can change until commit. Checking first and locking later would
+let another checkout slip in between.
+
+**Why it is correct under `READ COMMITTED`.** Postgres's default isolation level
+is used. When a `FOR UPDATE` waits on a row that another transaction then
+updates and commits, Postgres re-reads the newest version of that row before
+returning it. The waiting checkout therefore computes `available_stock` from the
+stock the previous checkout left, not from the value before it waited.
+
+```
+  checkout A                               checkout B  (same product, stock 1)
+  BEGIN                                    BEGIN
+  SELECT ... FOR UPDATE OF i  -> locked
+    available = 1                          SELECT ... FOR UPDATE OF i   (waits)
+  UPDATE reserved + 1
+  INSERT order ...
+  COMMIT                     -> released   -> row re-read: available = 0
+                                           quantity 1 > 0 -> 400 Insufficient stock
+                                           ROLLBACK
+```
+
+**Why `ORDER BY ci.product_id`.** Two carts holding products X and Y in
+different orders could otherwise lock X then Y and Y then X, and deadlock.
+Sorting gives every checkout the same lock order, so a cycle cannot form. §15
+includes a probe built to provoke exactly that case.
+
+**Why `FOR UPDATE OF i`.** Of the joined tables, only inventory rows are
+locked. Products and cart items are read but not locked, so checkouts do not
+block catalog edits, and checkouts of different products never wait for each
+other.
+
+**Why lock the cart as well.** Without it, one customer double-submitting
+checkout gets two orders. Both requests lock the same inventory rows; the second
+waits, then re-reads the inventory rows, but not the cart items, which it still
+sees in the snapshot its statement started with. It reserves stock again and
+creates a second order from a cart the first request already emptied. Measured
+before the fix, this happened in 9 of 10 trials (§15). With the cart row locked
+first, the second request waits at step 1, and its step 2 is a new statement
+that sees the emptied cart: `400 Cart is empty`. Carts belong to one customer,
+so this lock never makes two customers wait for each other, and §15 measured no
+throughput cost.
+
+**Deleted products fail the order.** A product soft deleted while it sat in a
+cart used to be filtered out by the join, so the order was silently placed
+without it and the line removed with the rest of the cart. The line is now read
+and rejected like an unavailable product.
+
+**All or nothing.** One bad line fails the whole order and reserves nothing. A
+partial order would be a worse result for the customer than a clear refusal, and
+it keeps one order equal to one consistent total.
+
+**One statement per step.** Reserving stock and inserting order lines use
+`unnest` over arrays, so a cart of N items costs a fixed number of round trips
+instead of 2N while the locks are held.
+
+**Commit before publishing.** Publishing `order.created` before `COMMIT` could
+announce an order that a failed commit never created. `publishEvent` never
+throws (§12), so publishing after commit costs nothing in correctness.
+
+### Rollback
+
+Every multi-statement write has the same shape:
 
 ```ts
 const client = await pool.connect();
 try {
   await client.query('BEGIN');
-  // ... multiple client.query() calls, any of which can throw ...
+  // ... statements, any of which may throw ...
   await client.query('COMMIT');
 } catch (error) {
   await client.query('ROLLBACK');
@@ -345,70 +710,665 @@ try {
 }
 ```
 
-If any statement between `BEGIN` and `COMMIT` throws — a validation `AppError` thrown deliberately by application code (e.g. "insufficient stock"), or a genuine Postgres error (e.g. a `CHECK` constraint violation) — control jumps straight to `catch`, which issues `ROLLBACK` on that same connection before re-throwing. Postgres discards every change made since `BEGIN` as a unit; from any other connection's point of view, it's as if none of the statements in that transaction ever ran. `finally` always releases the connection back to the pool regardless of which path was taken, so a failed transaction doesn't leak a connection. This is what the live concurrency test relied on: when the second of two simultaneous `placeOrder` calls found (after acquiring its `FOR UPDATE` lock) that stock was already exhausted by the first, it threw, rolled back, and left `reserved_stock` exactly as the first transaction's commit had left it — no partial reservation, no phantom order row.
+A deliberate `AppError`, a constraint violation or a lost connection all reach
+`ROLLBACK`. Postgres discards everything since `BEGIN`, and `finally` always
+returns the connection to the pool. Used by `createProduct`, `placeOrder`,
+`cancelOrder`, `updateStatus`, the success path of `process`, and `refund`.
 
-### Kafka consumer design
+### Releasing and consuming stock after checkout
 
-`src/consumers/index.ts` exports a single `startConsumers()`, called once from `server.ts` (deliberately not from `app.ts` — the health-check unit test imports `app`, and doing this there would mean every test run tries to join real Kafka consumer groups).
+Cancellation and refund release a reservation; delivery consumes it. All three
+go through `adjustOrderStock(client, orderId, 'release' | 'consume')` in
+`src/modules/inventory/inventory.stock.ts`, inside the caller's transaction. It
+locks the order's inventory rows with `ORDER BY product_id … FOR UPDATE`, the
+same global order checkout uses, then applies one `unnest` update. Updating row
+by row in whatever order `order_items` returned could lock Y then X while a
+checkout holds X and waits for Y.
 
-- **AuditConsumer** (`groupId: 'audit-consumer'`) subscribes to `Object.values(KAFKA_TOPICS)` — every topic the system currently defines, with no per-topic logic — and logs `[AUDIT] {timestamp} | topic: {topic} | payload: {json}` for each message. Its only job is a complete, human-readable record of everything that happened; if a new topic is added to `KAFKA_TOPICS` in `src/config/kafka.ts`, the audit consumer picks it up automatically with no code change.
-- **InventoryConsumer** (`groupId: 'inventory-consumer'`) subscribes only to `order.cancelled` and is the one consumer that actually changes state. Because `OrdersService.cancelOrder` *already* releases `reserved_stock` synchronously in its own transaction (see the lifecycle section above) before publishing the event, this consumer would double-decrement on every single cancellation if it just blindly repeated that work. It doesn't: both the synchronous handler and the consumer race to claim the same Redis key (`order:stock-released:{orderId}`) via `SET ... NX`, and only the side that wins the claim performs the decrement. In practice the synchronous handler always wins (it claims the key, *then* publishes — so the event literally cannot reach the consumer before the key exists), making the consumer's own decrement path a safety net for scenarios outside this codebase's current scope (e.g. a future service publishing `order.cancelled` directly without going through this HTTP endpoint) rather than something that fires on the normal path. Verified live: cancelling an order produces the audit log line *and* a separate "Reserved stock already released for order ..., skipping" log line from the InventoryConsumer, confirming the guard — not the decrement — is what actually runs.
-- As a second layer of defense independent of the Redis guard, `inventory.reserved_stock` still carries its Step 2 `CHECK (reserved_stock >= 0)` constraint, and the consumer's own decrement uses `GREATEST(reserved_stock - quantity, 0)` rather than a bare subtraction — so even in a hypothetical scenario where the Redis marker was lost (e.g. a Redis restart wiping the key), a duplicate release can't drive the column negative.
+Every transaction that touches an order and its payment also locks them in one
+order: the order row first, then the payment row (`cancelOrder`,
+`updateStatus`, `process`, `refund`).
 
-## Step 6 - Tests, Observability & CI
+### The backstop
 
-### Metrics tracked
+`CHECK (reserved_stock >= 0 AND reserved_stock <= total_stock)` holds whatever
+the application does. If the lock were removed, an oversell would fail at the
+`UPDATE` with a constraint violation (a `500`) instead of committing. The lock
+exists to turn that into a clean `400`; the constraint makes an oversell
+impossible either way.
 
-All five live in `src/config/metrics.ts` under one `Registry`, exposed at `GET /metrics`:
+### What is and is not protected
 
-| Metric | Type | Labels | What it tells you |
-|---|---|---|---|
-| `http_requests_total` | Counter | `method`, `route`, `status_code` | Traffic volume and error rate per endpoint. `route` is the parameterized pattern (`/api/v1/products/:id`), not the raw URL — so all requests for *any* product id aggregate into one time series instead of one per UUID, which is what makes this safe to keep forever rather than a cardinality explosion. |
-| `http_request_duration_seconds` | Histogram | `method`, `route` | Latency distribution per endpoint — lets you compute p50/p95/p99, not just an average, and see which specific route is slow. |
-| `cache_hits_total` | Counter | `key_pattern` (`product` or `search`) | How often the cache-aside reads (Step 4) actually avoid a database round-trip. A falling hit rate on `product` after a deploy would point at a cache-invalidation bug flushing more than it should. |
-| `cache_misses_total` | Counter | `key_pattern` | The complement of hits — `hits / (hits + misses)` is the effective cache hit ratio per cache. |
-| `kafka_events_published_total` | Counter | `topic` | Confirms events are actually reaching Kafka (as opposed to silently failing inside `publishEvent`'s catch block) — a topic with zero increments despite the triggering action clearly happening (e.g. products being updated) is a sign the producer can't reach the broker. |
+| Scenario | Protected by | Result |
+| --- | --- | --- |
+| Many customers, one product, little stock | Inventory row lock | Exactly the stock is sold (§15) |
+| Carts sharing products in different orders | Sorted lock order | No deadlock (§15) |
+| Stock set below current reservations | `CHECK` constraint | Rejected |
+| One customer submitting checkout twice at once | Cart row lock | One order; the second request gets `400 Cart is empty` (§15) |
+| Cancel, refund or delivery racing a checkout on shared products | Same sorted lock order | No deadlock |
+| Two carts' stock checks at add-to-cart time | Nothing; it is advisory | Checkout re-checks under the lock |
 
-**A real bug found and fixed while wiring up the HTTP metrics**: the route label was initially built from `req.baseUrl + req.route.path`, read inside a `res.on('finish', ...)` callback. That worked for successful responses, but for error responses — anything that reaches the global `errorHandler` via `next(error)` — Express resets `req.baseUrl` back to `''` as the request unwinds out of the nested module router, *before* the error handler sends the response. The symptom was subtle: 404s and other error responses recorded metrics under a bare route like `/:id` instead of `/api/v1/products/:id`, silently fragmenting what should have been one time series into two. The fix reconstructs the route pattern from `req.originalUrl` (the real path requested) and `req.route.path` (the locally-matched pattern, which *does* survive the error unwind) by stripping as many trailing path segments off `originalUrl` as `route.path` has segments, then appending `route.path` back on — neither of those two inputs is ever reset by Express's router unwinding, so the reconstruction is correct for both success and error responses.
+---
 
-### Request tracing end to end
+## 11. Order lifecycle and payments
 
-1. `requestIdMiddleware` (`src/middleware/requestId.ts`) is the very first middleware in `app.ts`. It generates a UUID, sets it as both `req.requestId` and the `X-Request-ID` response header, then calls the rest of the middleware chain *inside* `runWithRequestId(id, next)`.
-2. `runWithRequestId` (`src/utils/requestContext.ts`) uses Node's `AsyncLocalStorage` to bind that id to the current async execution context — every `await` down the call chain from here (through middleware, into a controller, into a service, into a database query) stays inside that same context, no matter how deep the call stack gets, without the id being explicitly threaded through every function signature.
-3. `config/logger.ts`'s Winston format pipeline includes a custom `requestIdFormat()` step that calls `getRequestId()` on every single log call and merges the result into the log entry if present. This means **every** `logger.info`/`logger.error` call anywhere in the codebase — in a controller, deep inside `OrdersService.placeOrder`, inside the global error handler — automatically carries the request's id with zero changes needed at each call site.
-4. The client that made the request sees the same id in the `X-Request-ID` response header, so a bug report ("I got an error at 3:47pm") can be tied back to the exact log lines for that request by grepping for one id — including lines emitted from deep inside business logic, not just the top-level access log line `requestLogger` (Step 1) already produced.
+### Status machine
 
-### Test strategy
+```
+                    payment completes          admin            admin
+     placeOrder  ->  pending  ------------>  confirmed  ---->  shipped  ---->  delivered
+                        |                        |                              (stock leaves:
+                        | customer cancels       | customer cancels,            total and reserved
+                        v                        v admin refunds                both decrease)
+                    cancelled                cancelled
+                   (reservation released)   (reservation released,
+                                             payment refunded)
+```
 
-- **`tests/unit/`** — no external dependencies (no DB/Redis/Kafka); fast, for logic that can be verified in isolation (currently just the `/health` shape).
-- **`tests/integration/`** — hit the real Express app (via `supertest`, in-process, no real HTTP socket) against a real PostgreSQL + Redis, exercising complete request/response cycles including validation, RBAC, database writes, and cache behavior. Each file covers one module (`auth`, `products`, `cart`, `orders`, `payments`) plus one cross-cutting concern (`concurrency`).
-- Tests favor **freshly-created, disposable data** (a new product with a timestamped SKU, a new throwaway user) over asserting against exact seed-data values wherever practical. This is deliberate: it keeps tests correct regardless of what other test files did first (Jest's file execution order isn't something this suite relies on), and avoids a whole class of flakiness where one test's cleanup (or lack of it) silently breaks an unrelated test that happens to run after it.
-- Two real bugs were caught specifically *by building this test infrastructure*, not by the application code being wrong on its own:
-  1. `node-pg-migrate`'s bundle is ESM-only and can't be parsed by `ts-jest` if `runner` is imported directly into a test file's module graph — fixed by shelling out to the existing `scripts/migrate.ts` (run via `ts-node` in its own process) from `tests/setup.ts` instead of importing the migration runner in-process.
-  2. Re-running the incrementally-idempotent `seed()` between test runs (rather than truncating first) let leftover data from a previous run — e.g. a stale item sitting in the shared seeded customer's cart — silently break a *later* run's "place an order" test, even though the test itself was correct. Fixed by having `tests/setup.ts` truncate every table before reseeding, since the test database is fully disposable and there's no reason to preserve anything between runs.
-- **`jest.config.js` runs test files serially (`maxWorkers: 1`)**: the integration suite shares one real, mutable database across files — the same three seeded users' carts and orders. Running files in parallel would let, say, `cart.test.ts` and `orders.test.ts` race each other over the same customer's single cart. Serial execution costs some wall-clock time but eliminates an entire category of non-deterministic failures.
+| Transition | Triggered by | Side effect |
+| --- | --- | --- |
+| → `pending` | `POST /orders` | Stock reserved |
+| `pending` → `confirmed` | `POST /payments/process/:id` succeeding | Payment `completed`, same transaction |
+| `confirmed` → `shipped` → `delivered` | `PUT /orders/:id/status` (admin) | On `delivered`, total and reserved stock both decrease |
+| `pending` or `confirmed` → `cancelled` | `PUT /orders/:id/cancel` (owner) | Reservation released; a `completed` payment is marked `refunded`; `order.cancelled` published |
+| `confirmed` → `cancelled` | `POST /payments/refund/:id` (admin) | Payment `refunded`; reservation released |
 
-### How the concurrency test proves inventory safety
+`ALLOWED_TRANSITIONS` maps each status to its single successor
+(`pending → confirmed → shipped → delivered`). The admin endpoint accepts only
+that successor, so `pending → shipped` and `confirmed → confirmed` are both
+`400`. The zod schema already excludes `pending` and `cancelled` as targets.
+`cancelled` and `delivered` are terminal. Status changes lock the order row
+(`SELECT … FOR UPDATE`), so two admins cannot apply conflicting transitions.
 
-See `DOCS/TESTING-GUIDE.md` for the full walkthrough and how to read its output; the short version: `tests/integration/concurrency.test.ts` creates a product with `total_stock = 3`, gives 10 independent disposable customers each their own cart with 1 unit of it, and fires all 10 `POST /orders` calls at once via `Promise.all` — no sequencing. It then asserts exactly 3 succeeded, exactly 7 failed, and the database's `reserved_stock` is exactly 3 (never more, via the row lock; never less, since 3 genuine successes must have each incremented it).
+A `confirmed` order has been paid for, so cancelling it also marks its
+`completed` payment `refunded`, in the same transaction. Otherwise the customer
+would lose both the goods and the money.
 
-This is a meaningful test — not a tautology — specifically *because* the ten requests are fired without any coordination between them. An implementation that reads "is there enough stock?" and writes "reserve it" as two separate, unlocked steps would let more than 3 of these 10 requests read "yes, there's stock" before any of them commits a reservation, overselling the product. The only thing standing between that failure mode and correct behavior is the `SELECT ... FOR UPDATE OF i` in `OrdersService.placeOrder` (Step 5), which forces the ten concurrent transactions to serialize on the same inventory row: the first to acquire the lock reads `available_stock`, reserves, and commits; the second only gets to read *after* the first's commit is visible, sees less stock available, and so on until the 4th request's read correctly reflects zero stock left and fails. The test would only pass by coincidence — or not at all — if that locking were ever accidentally removed, which is exactly the kind of regression this test exists to catch.
+### Idempotent payment initiation
 
-### CI pipeline stages
+`paymentKey` is chosen by the client, typically a UUID generated once per
+checkout attempt, and is unique in the database.
 
-`.github/workflows/ci.yml` runs on every push and pull request to `main`, as three sequential jobs:
+```
+  POST /payments/initiate { orderId, paymentKey }
+  1. SELECT by payment_key       found, same user and order -> 200, the existing payment
+                                 found, other user          -> 403
+                                 found, other order         -> 409
+  2. load the order              missing -> 404; not the caller's -> 403
+  3. INSERT (amount = orders.total_amount, status 'pending')   -> 201
+       unique violation (a concurrent request inserted first)
+         -> SELECT by key and return that row                  -> 200
+```
 
-1. **`lint`** — `npm ci` + `npm run lint`. Fails fast on style/type issues before spending time on service containers.
-2. **`test`** — depends on `lint` passing. Spins up `postgres:16-alpine` and `redis:7-alpine` as service containers (no Kafka service — deliberately: the app's Kafka handling is designed to degrade gracefully without a broker, verified locally by stopping Kafka and confirming the full suite still passes, just slightly slower due to the bounded connection-timeout fallback). Runs `npm run migrate` and `npm run seed` against the plain dev-shaped database (a real check that the migration/seed scripts themselves work end-to-end in a clean environment), then `npm test`, which internally provisions and manages its own separate `ecommerce_test` database regardless of what the previous two steps did.
-3. **`build`** — depends on `test` passing. Runs `tsc --noEmit` (a pure type-check, catching anything `ts-jest`'s per-file transpilation might not, since it type-checks the whole program at once) and `docker build` against the existing multi-stage `Dockerfile`, confirming the production image still builds.
+| Case | Result |
+| --- | --- |
+| First request | New `pending` payment, `201` |
+| Retry after a lost response | The same payment, `200`; no second row |
+| Two first requests racing | One insert wins; the other hits the unique constraint and returns the winner's row |
 
-### Glossary
+The `SELECT` in step 1 is an optimisation for the common retry. The unique
+constraint is what actually guarantees one payment per key.
 
-- **ACID** — Atomicity, Consistency, Isolation, Durability: the four guarantees a database transaction provides. In this project, `OrdersService.placeOrder` is the clearest example — validating stock, reserving it, creating the order, and clearing the cart either *all* happen or *none* of them do (atomicity), enforced with explicit `BEGIN`/`COMMIT`/`ROLLBACK` on a single `pg` client.
-- **Idempotency** — performing the same operation multiple times has the same effect as performing it once. `POST /payments/initiate`'s `paymentKey` is the idempotency mechanism here: retrying the exact same request (e.g. after a lost network response) returns the *same* payment record instead of creating a second one.
-- **Soft delete** — marking a row as deleted (`products.is_deleted = true`) instead of running `DELETE FROM products`. Used here so order history can still reference a product's row (for `order_items.product_id`) even after a seller "deletes" it, while every customer-facing query filters `is_deleted = false` so it appears gone.
-- **Reserved inventory** — the `inventory.reserved_stock` column, tracking stock that's been claimed by a pending order but hasn't yet physically left the warehouse. `available_stock = total_stock - reserved_stock` is what customers see; `total_stock` only drops when an order is actually `delivered`.
-- **tsvector** — PostgreSQL's preprocessed, searchable representation of text (stemmed, stripped of stop words). `products.search_vector` is one, kept in sync by a trigger, and matched against user search terms via `plainto_tsquery` — this is what makes `GET /search`'s keyword matching fast and typo-tolerant-ish (via stemming) instead of a slow `LIKE '%...%'` scan.
-- **Sliding window rate limit** — a rate limiter that counts requests in the *trailing* N minutes from *now*, rather than resetting at fixed clock boundaries (e.g. every hour on the hour). Implemented here with a Redis sorted set per `(route, IP)`: old entries are pruned by score (timestamp) on every check, so the window is always "the last 15 minutes," continuously, not "since the top of this hour."
-- **Cache-aside pattern** — the application code itself manages the cache: check the cache, and only query the database (then populate the cache) on a miss. Used for both `GET /products/:id` (`product:{id}`, 10 min TTL) and `GET /search` (`search:{hash}`, 5 min TTL) — the alternative approaches (write-through, the database engine's own caching) weren't used because they don't offer the same easy, explicit invalidation on writes.
-- **Token rotation** — issuing a *new* refresh token every time one is used, and immediately invalidating the old one. Implemented in `AuthService.refresh`: the old session row is deleted and a new one inserted in the same call, so a refresh token can only ever be used once — replaying a stolen-but-already-used one fails immediately.
+**The amount is never taken from the request.** It is copied from
+`orders.total_amount`. A retry must not be able to change what is charged; if
+the client supplied the amount, an idempotency key would not guarantee that.
+
+**The key is bound to its order.** Reusing a key with a different `orderId` is a
+`409`. Returning the original payment would tell the client it is paying one
+order while it holds a payment for another.
+
+A payment that has `failed` stays failed. Retrying with the same key returns the
+failed record, and `process` refuses it. A new attempt needs a new key.
+
+### Processing
+
+```
+  POST /payments/process/:id
+  unlocked reads: payment exists, is the caller's, is pending     fast 404 / 403 / 400
+  "call the provider": success = Math.random() > 0.1
+  BEGIN
+  1. SELECT status FROM orders WHERE id = $1 FOR UPDATE           not pending -> 400
+  2. UPDATE payments SET status = completed | failed
+     WHERE id = $1 AND status = 'pending' RETURNING *             no row -> 400 already processed
+  3. success: UPDATE orders SET status = 'confirmed'
+  COMMIT
+  failure -> 402 (the failed status is committed first)
+  success -> publish payment.completed
+```
+
+The unlocked reads only produce quick, specific errors. Correctness comes from
+the transaction:
+
+- **The order lock** serialises every attempt to pay one order. An order can have several `pending` payments (one per key); without the lock, processing them concurrently completed all of them. The test that processes four payments for one order at once found all four completed when run against the code before the fix.
+- **The conditional `UPDATE`** makes one payment's transition from `pending` happen once, even if the same payment is processed twice at the same moment.
+
+### Refunds
+
+`refund` reads the payment's order id, then locks the order, then the payment.
+It requires the payment to be `completed` and the order to be `confirmed`:
+paid, but not yet shipped. It releases the reservation, marks the payment
+`refunded` and the order `cancelled`, all in one transaction.
+
+Refusing shipped and delivered orders matters for stock. A delivered order's
+reservation has already been consumed, so releasing it again would take
+`reserved_stock` below zero (before the fix, a `500` from the `CHECK`
+constraint) or, if other orders held reservations of the product, silently free
+theirs. Returns after shipping would need their own flow (§18).
+
+---
+
+## 12. Events
+
+### Producer
+
+```ts
+publishEvent(topic, payload)
+  1. connect the producer on first use (a module-level flag)
+  2. send one JSON message to the topic
+  3. kafka_events_published_total{topic}++
+  on any error: log it and return; never throw
+```
+
+A single `kafkajs` producer is created when the module loads but connects only
+on the first publish, so importing the app (as the tests do) opens no sockets.
+
+**Why events never fail a request.** An event reports something that has
+already committed. If the broker is down, a seller's price change should still
+return `200`. Losing an event to a broker outage is accepted at this scope; an
+outbox table written in the same transaction would remove that loss (§18).
+
+**Fail fast.** The client is configured with `connectionTimeout: 2000` and one
+retry (at most 1 s backoff). The `kafkajs` defaults (5 retries, backoff up to
+30 s) could hold a request for minutes when the broker is unreachable, which
+would defeat "never block the request".
+
+### Topics
+
+| Topic | Published by | Payload |
+| --- | --- | --- |
+| `product.updated` | `updateProduct` | `productId`, `sellerId`, `updatedAt` |
+| `inventory.updated` | `updateStock`, only at or below the threshold | `productId`, `totalStock`, `reservedStock`, `availableStock`, `lowStockThreshold` |
+| `order.created` | `placeOrder`, after commit | `orderId`, `userId`, `items[]` with `unitPrice`, `totalAmount` |
+| `order.cancelled` | `cancelOrder`, after commit | `orderId`, `userId`, `items[]` |
+| `payment.completed` | `process`, after commit | `paymentId`, `orderId`, `userId`, `amount` |
+
+Messages have no key, so the default partitioner spreads them and there is no
+per-order ordering guarantee.
+
+### Consumers
+
+`startConsumers()` runs in the same process, started by `server.ts`. If it fails,
+the error is logged and the server keeps serving without consumers.
+
+| Consumer | Group | Topics | Does |
+| --- | --- | --- | --- |
+| `AuditConsumer` | `audit-consumer` | every value in `KAFKA_TOPICS` | Logs `[AUDIT] <time> \| topic \| payload`; a new topic is picked up with no code change |
+| `InventoryConsumer` | `inventory-consumer` | `order.cancelled` | Releases the order's reservation, unless it has already been released |
+
+### Exactly-once stock release
+
+Cancellation releases stock twice over: synchronously in `cancelOrder`'s
+transaction, and again in `InventoryConsumer` when the event arrives.
+Unguarded, every cancellation would be released twice. Both sides therefore
+claim one Redis key, and only the side that wins the claim does the work:
+
+```
+  cancelOrder                                  InventoryConsumer
+  BEGIN
+  release reservations
+  status = cancelled
+  COMMIT
+  SET order:stock-released:{id} 1 NX EX 7d   (claims)
+  publish order.cancelled  ------------------>  SET order:stock-released:{id} 1 NX EX 7d
+                                                -> not claimed: log "already released", skip
+```
+
+The synchronous path claims before it publishes, so on the normal path the
+consumer always loses. The consumer's release exists for cancellations that do
+not come through this endpoint.
+
+A second layer does not depend on Redis: the consumer's update is
+`GREATEST(reserved_stock - quantity, 0)`, and the `CHECK` constraint forbids a
+negative value, so even a lost claim key cannot drive the column below zero.
+
+---
+
+## 13. Observability
+
+### Request ids
+
+```
+  requestIdMiddleware
+    id = randomUUID()
+    req.requestId = id;  res.setHeader('X-Request-ID', id)
+    runWithRequestId(id, next)        AsyncLocalStorage.run({ requestId }, next)
+         |
+         |  every await below stays inside this async context
+         v
+  logger.error(...) anywhere          a Winston format calls getRequestId()
+                                      and adds it to the log line
+```
+
+The id is never passed as an argument, yet every log line during the request
+carries it: middleware, services, the error handler. The client gets the same
+id in `X-Request-ID`, so a report ("error at 15:47") maps to that request's log
+lines with one search.
+
+### Logs
+
+Winston, level from `LOG_LEVEL`. Development prints coloured
+`HH:mm:ss [level] [requestId] message`. Production prints one JSON object per
+line. `requestLogger` writes one `http`-level access line per response:
+`METHOD url status - N.Nms`.
+
+### Metrics
+
+`GET /metrics`, Prometheus text format, one registry:
+
+| Metric | Type | Labels | Answers |
+| --- | --- | --- | --- |
+| `http_requests_total` | Counter | `method`, `route`, `status_code` | Traffic and error rate per endpoint |
+| `http_request_duration_seconds` | Histogram | `method`, `route` | Latency percentiles per endpoint |
+| `cache_hits_total` | Counter | `key_pattern` (`product`, `search`) | Hit ratio per cache |
+| `cache_misses_total` | Counter | `key_pattern` | |
+| `kafka_events_published_total` | Counter | `topic` | Whether events actually reach the broker |
+
+**The route label is the pattern, not the URL.** `/api/v1/products/:id`, not
+one series per UUID. Building it from `req.baseUrl + req.route.path` fails for
+errors: when `next(error)` unwinds out of a module router, Express resets
+`req.baseUrl`, so error responses were recorded as `/:id`. The middleware
+instead takes `req.originalUrl`, removes as many trailing segments as
+`req.route.path` has, and appends `req.route.path`. Neither input is reset.
+
+Requests that match no route are all labelled `unmatched`. Using the raw path
+would create a new series for every distinct unknown URL anyone sends.
+
+### Tests
+
+| Suite | Scope | Count |
+| --- | --- | ---: |
+| `tests/unit/health.test.ts` | `/health` shape | 1 |
+| `tests/integration/auth.test.ts` | Register, duplicate, validation, login, refresh, logout, concurrent refresh | 9 |
+| `tests/integration/rateLimit.test.ts` | A burst of 15 logins admits exactly 5 | 1 |
+| `tests/integration/products.test.ts` | List, get, RBAC, ownership, soft delete | 7 |
+| `tests/integration/cart.test.ts` | Add, stock limit, unavailable, update, remove, clear | 6 |
+| `tests/integration/orders.test.ts` | Place, empty cart, insufficient stock, cancel, lifecycle, double submit, deleted product | 8 |
+| `tests/integration/payments.test.ts` | Initiate, idempotent retry, process, refund, refund after shipping, cancel refunds, key reuse, concurrent processing | 8 |
+| `tests/integration/concurrency.test.ts` | 10 simultaneous checkouts for 3 units | 1 |
+
+A race shows up only some of the time, so the double-submit, concurrent-refresh
+and concurrent-processing tests each repeat 10 independent trials. All three
+fail against the code before the fixes described in §7, §10 and §11, and pass
+after them.
+
+Integration tests run the real app in process through `supertest`, against a
+real Postgres and Redis. `tests/setup.ts` creates `ecommerce_test` if missing,
+runs migrations in a child process (the migration library is ESM-only and
+cannot load under `ts-jest`), truncates every table, reseeds and clears rate
+limit keys before each file. Files run serially (`maxWorkers: 1`) because they
+share the seeded users' carts. Kafka is optional: publishing fails fast and is
+logged.
+
+CI (`.github/workflows/ci.yml`) runs `lint` → `test` (Postgres and Redis service
+containers, `migrate`, `seed`, `npm test`) → `build` (`tsc --noEmit`,
+`docker build`).
+
+---
+
+## 14. Benchmark methodology
+
+### Benchmarks
+
+| Script | Measures |
+| --- | --- |
+| `scripts/bench/cache.ts` | `GET /products/:id` latency and throughput, cache miss against cache hit, sequential and 50 in flight, over an 8,000-product catalog |
+| `scripts/bench/throughput.ts` | `POST /orders` throughput, 1 in flight against 32, with orders spread across products and with all on one product |
+| `scripts/bench/oversell.ts` | 200 buyers, 50 units, 64 in flight: orders confirmed, units reserved |
+| `scripts/bench/deadlock.ts` | 200 five-item carts over 20 shared products, half in reverse order, 32 in flight |
+
+Further runs, whose output is in `scripts/bench/results/`, test specific
+suspicions from reading the code:
+
+| Run | Output |
+| --- | --- |
+| One customer, two simultaneous checkouts, 10 trials, after the fix | `double-submit.txt` |
+| The same probe before the fix | `before-fixes/double-submit.txt` |
+| Refund of a payment whose order was already delivered, before the fix | `before-fixes/refund-after-delivery.txt` |
+| `throughput.ts` with and without the cart row lock, alternating | `ab-cart-lock.txt` |
+
+### Rules
+
+| Rule | Reason |
+| --- | --- |
+| Production build (`npm run build`, `node dist/src/server.js`, `NODE_ENV=production`, `LOG_LEVEL=error`) | `ts-node` and debug-level logging would measure the tooling |
+| The client is a separate Node process using `fetch` over loopback | Measures the full HTTP path, as a client would see it |
+| Fixtures are inserted straight into Postgres before timing | Setup is not part of what is measured |
+| Every buyer has their own user and cart; tokens are signed directly | Login rate limits would otherwise cap the run |
+| Each cache sample uses a never-requested id for the miss, then the same id for the hit | The two arms do identical work apart from the cache |
+| A warm-up before measuring (50 lookups; 1 order) | JIT compilation and pool growth are not charged to the first arm |
+| Throughput from the wall time of the whole run | Not limited by timer resolution |
+| `cache.ts` and `throughput.ts` run three times; medians reported with ranges | One run on a laptop proves little |
+| Bench rows are deleted afterwards | The dev database is left as it was |
+
+### Limits of the measurements
+
+- **One machine, not isolated.** Client, server, Postgres and Redis share a laptop's cores; load average at the start was 3.19. Separate sessions on the same machine differ by more than some of the effects measured (§15).
+- **Loopback only.** No real network latency between the app and its clients or its databases. Over a network each round trip costs more, which favours the cache and penalises multi-query endpoints more than these numbers show.
+- **The Postgres pool has 10 connections** (the `pg` default; `db.ts` sets no `max`). Every concurrent arm has more requests in flight than connections, so they also measure queueing for a connection.
+- **Small data.** At most 8,000 products; everything fits in Postgres's buffer cache.
+- **`oversell.ts` and `deadlock.ts` ran once.** They check correctness, not speed, and their outcomes are counts.
+- **`scripts/bench/checkout.ts` was not run.** It starts with `FLUSHALL`, which would erase the whole development Redis instance.
+
+---
+
+## 15. Performance results
+
+Every number here is taken from `scripts/bench/results/`. The machine is an
+Apple M2 Pro (12 cores) with 16 GB of RAM, running macOS 26.5.2, Node
+v25.8.2, PostgreSQL 16.14 and Redis 8.6.2, all local. The code is commit
+`8a8a271` plus the uncommitted changes listed in `environment.txt`: the sorted
+lock order and batched statements in checkout, and the fixes described in §7,
+§10 and §11. Timing figures are medians of three runs.
+
+### Summary
+
+| Measurement | Result |
+| --- | --- |
+| `GET /products/:id`, one at a time | hit 0.28 ms, miss 0.56 ms mean; −59.3% median per-run change |
+| `GET /products/:id`, 50 in flight | hit 18,453, miss 9,757 req/s; +76.1% median per-run gain |
+| Checkout throughput, 32 in flight, no shared products | 1,523.3 orders/s (10.18× one at a time) |
+| Checkout throughput, 32 in flight, every order on one product | 911.5 orders/s (6.35× one at a time) |
+| 200 buyers for 50 units | 50 confirmed, 150 rejected with `400`, 0 errors, 0 oversold |
+| 200 overlapping carts in opposite lock orders | 200 of 200 succeeded, no deadlocks |
+| One customer, two simultaneous checkouts | one order in 10 of 10 trials (before the fix: two orders in 9 of 10) |
+| Cost of the cart row lock | none measurable |
+
+### Product lookup: cache against database
+
+`cache.ts`, 8,000 products, 200 sequential samples per arm:
+
+| Arm | Mean | p50 | p95 | p99 |
+| --- | ---: | ---: | ---: | ---: |
+| Miss (Postgres) | 0.56 ms | 0.54 ms | 0.77 ms | 1.07 ms |
+| Hit (Redis) | 0.28 ms | 0.24 ms | 0.35 ms | 1.13 ms |
+
+Mean latency fell by 64.6%, 59.3% and 50.0% in the three runs.
+
+2,000 requests, 50 in flight:
+
+| Arm | req/s | Mean | p50 | p95 | p99 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Miss (Postgres) | 9,757 | 5.06 ms | 4.36 ms | 8.98 ms | 11.18 ms |
+| Hit (Redis) | 18,453 | 2.67 ms | 2.45 ms | 5.96 ms | 7.24 ms |
+
+Throughput gain per run: +92.9%, +76.1%, +65.9%.
+
+What the data shows:
+
+- **A hit is about 0.3 ms cheaper than a miss** on loopback. The miss is one indexed query joining four tables plus a Redis `SET`; the hit is one Redis `GET`.
+- **The difference matters more under load.** With 50 requests in flight and 10 database connections, misses queue for a connection; hits never take one. Throughput nearly doubles.
+- **A hit is not free.** It still costs about 0.25 ms. The benchmark does not split that between HTTP handling, middleware, JSON and the Redis round trip.
+- **Tails are noisy.** The sequential hit p99 (1.13 ms) is above the miss p99 (1.07 ms); across runs the hit p99 ranged from 0.50 ms to 1.33 ms and the miss p99 from 0.83 ms to 2.69 ms. With 200 samples, p99 is the second-slowest request, so one scheduling hiccup moves it.
+- **Per-run changes and ratios of medians differ.** The medians in the tables give 9,757 → 18,453 req/s (+89%), but the three paired runs gave +92.9%, +76.1% and +65.9%; the summary uses the median paired change.
+
+### Checkout throughput
+
+`throughput.ts`, one-item carts, 300 orders per arm (299 for the first arm, whose
+first buyer is the warm-up):
+
+| Arm | orders/s | Mean | p50 | p95 | p99 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Spread, 1 in flight | 131.1 | 7.63 ms | 7.41 ms | 9.43 ms | 13.57 ms |
+| Spread, 32 in flight | 1,523.3 | 20.35 ms | 19.02 ms | 33.82 ms | 37.72 ms |
+| One product, 1 in flight | 142.5 | 7.01 ms | 7.06 ms | 8.72 ms | 16.36 ms |
+| One product, 32 in flight | 911.5 | 34.04 ms | 28.47 ms | 62.30 ms | 83.71 ms |
+
+Each cell is the median across the three runs, taken per column.
+
+| Speed-up of 32 in flight over 1 | Run 1 | Run 2 | Run 3 | Median |
+| --- | ---: | ---: | ---: | ---: |
+| Spread | 8.78× | 11.62× | 10.18× | 10.18× |
+| One product | 4.53× | 6.35× | 6.40× | 6.35× |
+
+What the data shows:
+
+- **A checkout takes about 7 ms end to end** when nothing else is running: around ten round trips to Postgres, a Redis delete, a `SCAN` of the Redis keyspace and a Kafka publish.
+- **Concurrency multiplies throughput about tenfold** when orders do not share products, while each order waits under three times longer. The likely reason is that most of a checkout is spent waiting on round trips, and those overlap across requests.
+- **A hot product costs a third of the throughput.** Concurrent throughput on a single inventory row was 37.5% below spread orders (median; the three runs ranged from −27.3% to −41.5%), and its p99 more than doubled. Every checkout of that product waits its turn for one row lock.
+- **The data does not isolate the ceiling.** The concurrent arms queue for 10 pool connections, share cores with Postgres and the client, and scan the Redis keyspace on every order. Separating those would need profiling that was not done.
+- Every order in every throughput run succeeded.
+
+### Cost of the cart row lock
+
+The cart lock added in §10 changes the checkout path, so it was measured
+separately. `ab-cart-lock.txt` runs `throughput.ts` four times, alternating
+between two builds that differ only in that one statement:
+
+| 32 in flight | Without lock | With lock |
+| --- | --- | --- |
+| Spread | 1,110.6 and 1,160.4 orders/s | 1,182.8 and 1,225.1 orders/s |
+| One product | 1,077.4 and 1,150.0 orders/s | 1,144.3 and 1,190.2 orders/s |
+
+The runs with the lock were no slower. This is expected: carts belong to one
+customer, and each buyer in the benchmark has their own, so the lock is never
+contended.
+
+The same session also shows how much the machine varies. The one-product arm
+ran at 891–975 orders/s in the three main runs and at 1,077–1,190 orders/s in
+the A/B runs minutes later, with the same code. Differences of that size
+between sessions are noise, not an effect of the code.
+
+### Correctness under concurrency
+
+`oversell.ts`, 200 buyers, 1 unit each, stock 50, 64 in flight:
+
+| Confirmed (`201`) | Rejected (`400`) | Errors (`5xx`) | Total / reserved stock | Oversold |
+| ---: | ---: | ---: | --- | ---: |
+| 50 | 150 | 0 | 50 / 50 | 0 |
+
+Exactly the stock was sold. Every rejection was a `400` and none was a `5xx`. A
+`CHECK` violation would have surfaced as a `500`, so the row lock turned the
+losers away, not the backstop.
+
+`deadlock.ts`, 200 buyers with five items each from a pool of 20 products, even
+and odd buyers holding the same items in opposite orders, 32 in flight:
+
+| Succeeded | Deadlocks or other errors |
+| ---: | ---: |
+| 200 | 0 |
+
+This run covers only the code with sorted locks. No comparison run without the
+`ORDER BY` was made.
+
+One customer, two simultaneous `POST /orders`, 10 trials:
+
+| | Trials with one order | Trials with two orders |
+| --- | ---: | ---: |
+| Before the fix (`before-fixes/double-submit.txt`) | 1 | 9 |
+| After the fix (`double-submit.txt`) | 10 | 0 |
+
+After the fix, every trial returned one `201` and one `400`, with the cart's 2
+units reserved once.
+
+`before-fixes/refund-after-delivery.txt`: before the fix, refunding a payment
+whose order was already delivered returned `500`. The release would have taken
+`reserved_stock` below zero, so the `CHECK` constraint rejected it and the
+transaction rolled back. The same request is now refused with `400` before any
+stock is touched; a test covers the shipped case.
+
+---
+
+## 16. Tradeoffs
+
+| Decision | Benefit | Cost |
+| --- | --- | --- |
+| Raw SQL through `pg`, no ORM | Every query is visible; locking and `unnest` batching are explicit | Hand-written mapping; conventions such as `is_deleted = false` repeated in every query |
+| `reserved_stock` beside `total_stock` | Cancellation and refund are exact inverses; physical stock changes only on delivery | Two counters to keep consistent; stock is held by unpaid orders with no expiry |
+| Pessimistic row locks at checkout | Overselling impossible; a clean `400` for the loser | Checkouts of one product run one at a time through the lock; 37.5% lower throughput for a single hot product (§15) |
+| `READ COMMITTED` with `FOR UPDATE` | No serialisation failures to retry | Correctness depends on locking the right rows, in a consistent order; a missed lock is a silent race, as the cart was (§10) |
+| Stateless JWT access tokens | No database read per request | Role changes and deactivation take effect only when the token expires |
+| Opaque refresh tokens in a table | Revocable; single use, even under concurrency | A database write per refresh |
+| Cache-aside with blanket `search:*` invalidation | Simple and never stale after a write completes | Every write scans the whole Redis keyspace; search is cold after each write |
+| Redis on the request path without fallback | Simple code | A Redis outage takes down cached reads, rate-limited routes and writes that invalidate (§17) |
+| Best-effort events after commit | Requests never fail because of Kafka | Events can be lost; no ordering per order |
+| Consumers in the web process | One thing to deploy | A consumer problem shares CPU and memory with request handling |
+| Client-chosen payment key, server-derived amount | Safe retries; amount cannot change | A failed payment needs a new key |
+| Services throw `AppError` with HTTP codes | Short, direct code | The business layer knows about HTTP |
+| Order totals summed as JavaScript numbers | Simple | Floating-point sums, rounded again by `numeric(10,2)` on insert; integer cents would be exact |
+| Default `pg` pool of 10 | No tuning needed at this scale | Concurrent requests queue for a connection (§15) |
+
+---
+
+## 17. Failure modes
+
+| Failure | Behaviour |
+| --- | --- |
+| Two checkouts for the same product | One waits on the inventory row lock; the loser gets `400 Insufficient stock` |
+| The same customer submits checkout twice at once | The second waits on the cart row lock, then gets `400 Cart is empty` (§15) |
+| A cart line whose product has been soft deleted | The whole order is refused with `400`; nothing is reserved |
+| Any statement fails mid-transaction | `ROLLBACK`; nothing from the transaction is visible; the connection is released |
+| Stock set below current reservations | `CHECK` violation; the update is rejected with `500` |
+| Refund of an order already shipped or delivered | `400`; only `confirmed` orders can be refunded |
+| Cancelling a `confirmed` (paid) order | Order cancelled, stock released, payment marked `refunded` |
+| Concurrent `process` calls for one order, on one or several payments | Serialised by the order row lock; at most one payment completes, the others get `400` |
+| Two concurrent refreshes with one refresh token | Exactly one succeeds; the other gets `401` |
+| A burst of concurrent login attempts | Exactly 5 are admitted; the Lua script makes the check atomic |
+| A payment key reused for a different order | `409` |
+| The app runs behind a proxy | `trust proxy` is not set, so `req.ip` is the proxy's address and every client shares one limit |
+| Redis unreachable | Cached reads, login and register fail with `500`; writes commit in Postgres, then return `500` when cache invalidation fails, so a retried checkout reports `Cart is empty` |
+| Kafka unreachable | Each publish waits for a failed connection attempt (2 s timeout, one retry), logs, and continues; requests succeed, slower; events are lost |
+| Kafka unreachable at startup | Consumers fail to start, the error is logged, the server keeps serving, and they are not retried |
+| Crash between `COMMIT` and publish | The order exists; its event was never sent |
+| A cached read races a write | Stale data can be cached for up to the TTL (600 s product, 300 s search) |
+| `JWT_SECRET` not set | In production the process refuses to start; elsewhere tokens are signed with `change-me` |
+| Anyone registers with `role: admin` | Accepted; there is no approval step |
+| Requests to many unknown URLs | All counted under one `route="unmatched"` label |
+| Access token of a user who was deactivated or changed role | Keeps working until it expires (up to 15 minutes) |
+| `SIGTERM` | The process exits immediately; Postgres rolls back open transactions |
+| Uncaught exception | Logged; the process exits with code 1 and relies on a supervisor to restart it |
+| Unhandled promise rejection | Logged; the process continues |
+
+---
+
+## 18. Future improvements
+
+In order of expected value, based on §15 and §17.
+
+1. **Outbox for events.** Write each event to a table in the same transaction as the change, and publish from there. No event is lost by a crash or an outage.
+2. **Degrade when Redis is down.** Catch cache errors and fall back to Postgres; never fail a committed write because invalidation failed.
+3. **Cheaper search invalidation.** A version number in the search key (`search:v{n}:{hash}`), incremented on write, replaces the keyspace scan with one `INCR`.
+4. **Reservation expiry.** Release stock held by `pending` orders after a timeout, so unpaid carts cannot hold stock indefinitely.
+5. **A returns flow.** Refunds are limited to orders that have not shipped (§11). Shipped and delivered orders need a return that puts stock back into `total_stock` when the goods arrive.
+6. **Security hardening.** Hash refresh tokens at rest, stop accepting `role` at registration, and set `trust proxy` for deployment behind a load balancer.
+7. **Money as integer cents** end to end.
+8. **Graceful shutdown.** Stop accepting connections, finish in-flight requests, disconnect consumers and the producer, and close the pool.
+9. **Better measurement.** Size the connection pool from measurements, profile the concurrent checkout ceiling, and run the benchmarks on a separate machine over a real network.
+
+---
+
+## Appendix: interview questions
+
+**How do you stop two customers buying the last unit?**
+Checkout locks the inventory rows it will reserve (`SELECT … FOR UPDATE OF i`)
+before checking stock. The second checkout waits, then re-reads the row after
+the first commits, sees no stock and fails with `400`. A `CHECK` constraint
+makes overselling impossible even if the lock were removed.
+
+**Why lock first, then check?**
+Checking before locking leaves a window in which another transaction can reserve
+the same stock. The check is only meaningful on a row nobody else can change
+until you commit.
+
+**Why is this correct under `READ COMMITTED`, not only `SERIALIZABLE`?**
+When `FOR UPDATE` has to wait for a row, Postgres returns the newest committed
+version once the lock is granted, not the version from the start of the
+statement. The stock check therefore sees the previous checkout's reservation.
+
+**How do you avoid deadlocks when carts share products?**
+Every checkout locks its inventory rows in `product_id` order, so no two
+checkouts can each hold a lock the other needs.
+
+**Why have `reserved_stock` at all?**
+Placing an order is not the moment stock leaves. Cancellation and refund must
+give it back, and that must not look like restocking. `total_stock` changes only
+on delivery; reservations are counted separately.
+
+**What does the transaction guarantee, and what does it not?**
+The reservation, order, order lines and emptied cart commit together or not at
+all. It does not cover Redis or Kafka: those happen after commit and can fail
+independently.
+
+**Why publish events after commit?**
+Publishing first could announce an order that a failed commit never created.
+After commit, every event describes something that exists. The price is that a
+crash between commit and publish loses the event.
+
+**How are payment retries made safe?**
+The client sends a `paymentKey` that is unique in the database. A retry finds
+the existing row and returns it. A race is settled by the unique constraint. The
+amount comes from the order, never the request, so a retry cannot change it.
+
+**Why are access tokens JWTs but refresh tokens not?**
+Access tokens are checked on every request, so verifying a signature beats a
+database read. Refresh tokens live for days, so they must be revocable, which
+means a row that can be deleted.
+
+**What is refresh token rotation?**
+Every refresh deletes the old session and issues a new token, so each refresh
+token works once and a replay fails.
+
+**Why a sliding window rather than a fixed window for rate limiting?**
+A fixed window allows twice the limit across a boundary. A sorted set of
+timestamps pruned on every request always counts the last N minutes.
+
+**How is the cache kept consistent?**
+Every write that changes a cached product deletes its key and all search keys
+after committing. Remaining staleness comes from a read racing a write, bounded
+by the TTL.
+
+**Why invalidate every search key instead of the affected ones?**
+Knowing which cached result pages contain a product would mean re-running those
+queries. Writes are rare, so a cold search cache after a write is cheaper.
+
+**Why `SCAN` instead of `KEYS`?**
+`KEYS` blocks single-threaded Redis for the whole scan. `SCAN` works in small
+batches. It still visits every key, so it gets slower as the keyspace grows.
+
+**Why `plainto_tsquery`?**
+It accepts arbitrary search-box text. `to_tsquery` expects operator syntax and
+fails on ordinary punctuation.
+
+**How does a log line deep in a service know the request id?**
+`AsyncLocalStorage` binds the id to the async context at the start of the
+request, and a Winston format reads it on every log call. Nothing passes it
+explicitly.
+
+**Why is the metrics label the route pattern?**
+One series per URL would create one series per product id and grow without
+bound. The pattern keeps one series per endpoint.
+
+**What happens if Kafka is down?**
+Publishing fails fast, is logged and is skipped; requests succeed and the events
+are lost. Postgres remains the record.
+
+**What happens if Redis is down?**
+Cached reads and the rate-limited auth routes fail, and writes commit but return
+errors when invalidation fails. This is the most important resilience gap.
+
+**What happens if a customer double-clicks "Place order"?**
+Both requests lock the customer's cart row first, so they run one after the
+other. The second sees the cart the first emptied and gets `400 Cart is empty`.
+Without that lock, 9 of 10 trials created two orders: the inventory lock alone
+does not help, because the waiting request re-reads the inventory rows but not
+the cart items.
+
+**How do you stop an order from being paid twice?**
+Every payment attempt locks the order row, re-checks that the order is still
+`pending`, and moves the payment out of `pending` with a conditional
+`UPDATE … WHERE status = 'pending'`. Two attempts on one order therefore run one
+at a time, and only the first can confirm it.
+
+**Why must every transaction lock rows in the same order?**
+Two transactions that each hold a lock the other needs deadlock. Checkout,
+cancellation, refund and delivery all lock inventory rows sorted by
+`product_id`, and the order row before the payment row, so no cycle can form.

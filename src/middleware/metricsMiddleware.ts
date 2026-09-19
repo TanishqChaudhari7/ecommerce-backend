@@ -9,8 +9,10 @@ import { httpRequestsTotal, httpRequestDurationSeconds } from '../config/metrics
 // pattern can be reconstructed by stripping as many trailing segments off
 // `originalUrl` as `route.path` has, then appending `route.path` back on.
 function getRoutePattern(req: Request): string {
+  // Unmatched requests share one label: using the raw path would create a new time
+  // series for every distinct unknown URL anyone sends.
   if (!req.route) {
-    return req.path;
+    return 'unmatched';
   }
 
   const fullPath = req.originalUrl.split('?')[0];

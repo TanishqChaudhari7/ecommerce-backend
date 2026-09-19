@@ -91,8 +91,11 @@ export class AuthService {
   }
 
   async refresh(oldRefreshToken: string): Promise<TokenPair> {
-    const sessionResult = await pool.query(
-      'SELECT id, user_id, expires_at FROM sessions WHERE refresh_token = $1',
+    // Consuming the session in one atomic DELETE is what makes a refresh token
+    // single-use: of two concurrent refreshes with the same token, only one gets the
+    // row back. Every failure path below would have deleted the session anyway.
+    const sessionResult = await pool.query<{ user_id: string; expires_at: Date }>(
+      'DELETE FROM sessions WHERE refresh_token = $1 RETURNING user_id, expires_at',
       [oldRefreshToken],
     );
     const session = sessionResult.rows[0];
@@ -102,7 +105,6 @@ export class AuthService {
     }
 
     if (new Date(session.expires_at).getTime() < Date.now()) {
-      await pool.query('DELETE FROM sessions WHERE id = $1', [session.id]);
       throw new AppError(401, 'Refresh token expired');
     }
 
@@ -112,11 +114,8 @@ export class AuthService {
     const user = userResult.rows[0];
 
     if (!user || !user.is_active) {
-      await pool.query('DELETE FROM sessions WHERE id = $1', [session.id]);
       throw new AppError(401, 'User no longer active');
     }
-
-    await pool.query('DELETE FROM sessions WHERE id = $1', [session.id]);
 
     return issueTokenPair(user);
   }

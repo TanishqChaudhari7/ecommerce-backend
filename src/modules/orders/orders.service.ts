@@ -3,6 +3,7 @@ import { redis, deleteKeysByPattern } from '../../config/redis';
 import { publishEvent, KAFKA_TOPICS } from '../../config/kafka';
 import { AppError } from '../../utils/AppError';
 import { UserRole } from '../auth/auth.types';
+import { adjustOrderStock } from '../inventory/inventory.stock';
 import { OrderDetail, OrderItemDetail, OrderSummary, OrderStatus } from './orders.types';
 
 const ALLOWED_TRANSITIONS: Partial<Record<OrderStatus, OrderStatus>> = {
@@ -14,8 +15,8 @@ const ALLOWED_TRANSITIONS: Partial<Record<OrderStatus, OrderStatus>> = {
 const STOCK_RELEASE_TTL_SECONDS = 60 * 60 * 24 * 7;
 
 async function invalidateProductCaches(productIds: string[]): Promise<void> {
-  for (const productId of productIds) {
-    await redis.del(`product:${productId}`);
+  if (productIds.length > 0) {
+    await redis.del(...productIds.map((productId) => `product:${productId}`));
   }
   await deleteKeysByPattern('search:*');
 }
@@ -42,26 +43,29 @@ async function fetchOrderItems(orderId: string): Promise<OrderItemDetail[]> {
 }
 
 async function fetchOrderDetail(orderId: string): Promise<OrderDetail> {
-  const orderResult = await pool.query<{
-    id: string;
-    status: OrderStatus;
-    total_amount: string;
-    created_at: Date;
-    updated_at: Date;
-  }>('SELECT id, status, total_amount, created_at, updated_at FROM orders WHERE id = $1', [
-    orderId,
+  // The three reads are independent, so issue them together rather than paying three
+  // sequential round trips on the checkout response path.
+  const [orderResult, items, paymentResult] = await Promise.all([
+    pool.query<{
+      id: string;
+      status: OrderStatus;
+      total_amount: string;
+      created_at: Date;
+      updated_at: Date;
+    }>('SELECT id, status, total_amount, created_at, updated_at FROM orders WHERE id = $1', [
+      orderId,
+    ]),
+    fetchOrderItems(orderId),
+    pool.query<{ status: string }>(
+      'SELECT status FROM payments WHERE order_id = $1 ORDER BY created_at DESC LIMIT 1',
+      [orderId],
+    ),
   ]);
+
   const order = orderResult.rows[0];
   if (!order) {
     throw new AppError(404, 'Order not found');
   }
-
-  const items = await fetchOrderItems(orderId);
-
-  const paymentResult = await pool.query<{ status: string }>(
-    'SELECT status FROM payments WHERE order_id = $1 ORDER BY created_at DESC LIMIT 1',
-    [orderId],
-  );
 
   return {
     id: order.id,
@@ -83,8 +87,11 @@ export class OrdersService {
     try {
       await client.query('BEGIN');
 
+      // Locking the cart serializes checkouts by the same customer: a double-submitted
+      // second request waits here, then (in a fresh statement snapshot) finds the cart
+      // the first request already emptied, instead of ordering the same items twice.
       const cartResult = await client.query<{ id: string }>(
-        'SELECT id FROM shopping_carts WHERE user_id = $1',
+        'SELECT id FROM shopping_carts WHERE user_id = $1 FOR UPDATE',
         [userId],
       );
       const cartId = cartResult.rows[0]?.id;
@@ -97,14 +104,16 @@ export class OrdersService {
         quantity: number;
         price: string;
         is_available: boolean;
+        is_deleted: boolean;
         available_stock: number;
       }>(
-        `SELECT ci.product_id, ci.quantity, p.price, p.is_available,
+        `SELECT ci.product_id, ci.quantity, p.price, p.is_available, p.is_deleted,
                 (i.total_stock - i.reserved_stock) AS available_stock
          FROM cart_items ci
-         JOIN products p ON p.id = ci.product_id AND p.is_deleted = false
+         JOIN products p ON p.id = ci.product_id
          JOIN inventory i ON i.product_id = p.id
          WHERE ci.cart_id = $1
+         ORDER BY ci.product_id
          FOR UPDATE OF i`,
         [cartId],
       );
@@ -114,7 +123,7 @@ export class OrdersService {
       }
 
       for (const item of itemsResult.rows) {
-        if (!item.is_available) {
+        if (item.is_deleted || !item.is_available) {
           throw new AppError(400, `Product ${item.product_id} is not available`);
         }
         if (item.quantity > item.available_stock) {
@@ -122,12 +131,16 @@ export class OrdersService {
         }
       }
 
-      for (const item of itemsResult.rows) {
-        await client.query(
-          'UPDATE inventory SET reserved_stock = reserved_stock + $1 WHERE product_id = $2',
-          [item.quantity, item.product_id],
-        );
-      }
+      await client.query(
+        `UPDATE inventory i
+         SET reserved_stock = i.reserved_stock + u.quantity
+         FROM unnest($1::uuid[], $2::int[]) AS u(product_id, quantity)
+         WHERE i.product_id = u.product_id`,
+        [
+          itemsResult.rows.map((item) => item.product_id),
+          itemsResult.rows.map((item) => item.quantity),
+        ],
+      );
 
       const totalAmount = itemsResult.rows.reduce(
         (sum, item) => sum + item.quantity * Number(item.price),
@@ -142,13 +155,17 @@ export class OrdersService {
       );
       orderId = orderResult.rows[0].id;
 
-      for (const item of itemsResult.rows) {
-        await client.query(
-          `INSERT INTO order_items (order_id, product_id, quantity, unit_price)
-           VALUES ($1, $2, $3, $4)`,
-          [orderId, item.product_id, item.quantity, item.price],
-        );
-      }
+      await client.query(
+        `INSERT INTO order_items (order_id, product_id, quantity, unit_price)
+         SELECT $1, u.product_id, u.quantity, u.unit_price
+         FROM unnest($2::uuid[], $3::int[], $4::numeric[]) AS u(product_id, quantity, unit_price)`,
+        [
+          orderId,
+          itemsResult.rows.map((item) => item.product_id),
+          itemsResult.rows.map((item) => item.quantity),
+          itemsResult.rows.map((item) => item.price),
+        ],
+      );
 
       await client.query('DELETE FROM cart_items WHERE cart_id = $1', [cartId]);
 
@@ -244,15 +261,16 @@ export class OrdersService {
       );
       items = itemsResult.rows;
 
-      for (const item of items) {
-        await client.query(
-          'UPDATE inventory SET reserved_stock = reserved_stock - $1 WHERE product_id = $2',
-          [item.quantity, item.product_id],
-        );
-      }
+      await adjustOrderStock(client, orderId, 'release');
 
       await client.query(
         "UPDATE orders SET status = 'cancelled', updated_at = now() WHERE id = $1",
+        [orderId],
+      );
+
+      // A confirmed order has been paid for; cancelling it must give the money back too.
+      await client.query(
+        "UPDATE payments SET status = 'refunded' WHERE order_id = $1 AND status = 'completed'",
         [orderId],
       );
 
@@ -307,19 +325,7 @@ export class OrdersService {
       ]);
 
       if (targetStatus === 'delivered') {
-        const itemsResult = await client.query<{ product_id: string; quantity: number }>(
-          'SELECT product_id, quantity FROM order_items WHERE order_id = $1',
-          [orderId],
-        );
-        for (const item of itemsResult.rows) {
-          await client.query(
-            `UPDATE inventory
-             SET total_stock = total_stock - $1, reserved_stock = reserved_stock - $1
-             WHERE product_id = $2`,
-            [item.quantity, item.product_id],
-          );
-        }
-        affectedProductIds = itemsResult.rows.map((item) => item.product_id);
+        affectedProductIds = await adjustOrderStock(client, orderId, 'consume');
       }
 
       await client.query('COMMIT');
