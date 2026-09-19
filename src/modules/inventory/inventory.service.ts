@@ -1,7 +1,8 @@
 import { pool } from '../../config/db';
-import { redis, deleteKeysByPattern } from '../../config/redis';
+import { invalidateProductCaches } from '../../config/redis';
 import { publishEvent, KAFKA_TOPICS } from '../../config/kafka';
 import { AppError } from '../../utils/AppError';
+import { isCheckViolation } from '../../utils/pgErrors';
 import { UserRole } from '../auth/auth.types';
 import { InventoryStatus, LowStockProduct } from './inventory.types';
 
@@ -24,15 +25,24 @@ export class InventoryService {
       throw new AppError(403, 'You do not own this product');
     }
 
-    const result = await pool.query<{
-      total_stock: number;
-      reserved_stock: number;
-      low_stock_threshold: number;
-    }>(
-      `UPDATE inventory SET total_stock = $1 WHERE product_id = $2
-       RETURNING total_stock, reserved_stock, low_stock_threshold`,
-      [totalStock, productId],
-    );
+    let result;
+    try {
+      result = await pool.query<{
+        total_stock: number;
+        reserved_stock: number;
+        low_stock_threshold: number;
+      }>(
+        `UPDATE inventory SET total_stock = $1 WHERE product_id = $2
+         RETURNING total_stock, reserved_stock, low_stock_threshold`,
+        [totalStock, productId],
+      );
+    } catch (error) {
+      // CHECK (reserved_stock <= total_stock): open orders already hold more than this.
+      if (isCheckViolation(error)) {
+        throw new AppError(409, 'Total stock cannot be lower than stock reserved by open orders');
+      }
+      throw error;
+    }
     const inventory = result.rows[0];
     if (!inventory) {
       throw new AppError(404, 'Inventory record not found');
@@ -40,8 +50,7 @@ export class InventoryService {
 
     const availableStock = inventory.total_stock - inventory.reserved_stock;
 
-    await redis.del(`product:${productId}`);
-    await deleteKeysByPattern('search:*');
+    await invalidateProductCaches([productId]);
 
     if (availableStock <= inventory.low_stock_threshold) {
       await publishEvent(KAFKA_TOPICS.INVENTORY_UPDATED, {

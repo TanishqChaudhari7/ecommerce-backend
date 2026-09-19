@@ -1,15 +1,7 @@
 import { Request, Response, NextFunction } from 'express';
 import { ordersService } from './orders.service';
-import { AppError } from '../../utils/AppError';
+import { requireUser } from '../../utils/requireUser';
 import { UpdateOrderStatusBody } from './orders.validation';
-import { AccessTokenPayload } from '../auth/auth.types';
-
-function requireUser(req: Request): AccessTokenPayload {
-  if (!req.user) {
-    throw new AppError(401, 'Missing access token');
-  }
-  return req.user;
-}
 
 export class OrdersController {
   async placeOrder(req: Request, res: Response, next: NextFunction): Promise<void> {
@@ -54,7 +46,6 @@ export class OrdersController {
 
   async updateStatus(req: Request, res: Response, next: NextFunction): Promise<void> {
     try {
-      requireUser(req);
       const { status } = req.body as UpdateOrderStatusBody;
       const order = await ordersService.updateStatus(req.params.id, status);
       res.status(200).json({ order });

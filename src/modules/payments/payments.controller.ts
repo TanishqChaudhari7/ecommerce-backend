@@ -1,21 +1,14 @@
 import { Request, Response, NextFunction } from 'express';
 import { paymentsService } from './payments.service';
-import { AppError } from '../../utils/AppError';
+import { requireUser } from '../../utils/requireUser';
 import { InitiatePaymentBody } from './payments.validation';
-
-function requireUserId(req: Request): string {
-  if (!req.user) {
-    throw new AppError(401, 'Missing access token');
-  }
-  return req.user.userId;
-}
 
 export class PaymentsController {
   async initiate(req: Request, res: Response, next: NextFunction): Promise<void> {
     try {
       const { orderId, paymentKey } = req.body as InitiatePaymentBody;
       const { payment, isNew } = await paymentsService.initiate(
-        requireUserId(req),
+        requireUser(req).userId,
         orderId,
         paymentKey,
       );
@@ -27,7 +20,7 @@ export class PaymentsController {
 
   async process(req: Request, res: Response, next: NextFunction): Promise<void> {
     try {
-      const payment = await paymentsService.process(requireUserId(req), req.params.paymentId);
+      const payment = await paymentsService.process(requireUser(req).userId, req.params.paymentId);
       res.status(200).json({ payment });
     } catch (error) {
       next(error);

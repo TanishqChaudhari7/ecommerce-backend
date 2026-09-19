@@ -1,7 +1,7 @@
 import { Consumer, EachMessagePayload } from 'kafkajs';
 import { kafka, KAFKA_TOPICS } from '../config/kafka';
 import { pool } from '../config/db';
-import { redis, deleteKeysByPattern } from '../config/redis';
+import { redis, invalidateProductCaches } from '../config/redis';
 import { logger } from '../../config/logger';
 
 const ALL_TOPICS = Object.values(KAFKA_TOPICS);
@@ -53,7 +53,6 @@ async function handleOrderCancelled({ message }: EachMessagePayload): Promise<vo
         'UPDATE inventory SET reserved_stock = GREATEST(reserved_stock - $1, 0) WHERE product_id = $2',
         [item.quantity, item.productId],
       );
-      await redis.del(`product:${item.productId}`);
     } catch (error) {
       logger.error('InventoryConsumer failed to release reserved stock', {
         orderId: event.orderId,
@@ -63,7 +62,7 @@ async function handleOrderCancelled({ message }: EachMessagePayload): Promise<vo
     }
   }
 
-  await deleteKeysByPattern('search:*');
+  await invalidateProductCaches(event.items.map((item) => item.productId));
 }
 
 async function startInventoryConsumer(): Promise<Consumer> {

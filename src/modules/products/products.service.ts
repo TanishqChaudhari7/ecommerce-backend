@@ -1,7 +1,8 @@
 import { pool } from '../../config/db';
-import { redis, deleteKeysByPattern } from '../../config/redis';
+import { redis, invalidateProductCaches } from '../../config/redis';
 import { publishEvent, KAFKA_TOPICS } from '../../config/kafka';
 import { AppError } from '../../utils/AppError';
+import { isForeignKeyViolation, isUniqueViolation } from '../../utils/pgErrors';
 import {
   CreateProductInput,
   Pagination,
@@ -13,15 +14,6 @@ import { PRODUCT_SELECT, toPublicProduct } from './products.query';
 import { cacheHitsTotal, cacheMissesTotal } from '../../config/metrics';
 
 const PRODUCT_CACHE_TTL_SECONDS = 600;
-
-function isUniqueViolation(error: unknown): boolean {
-  return (
-    typeof error === 'object' &&
-    error !== null &&
-    'code' in error &&
-    (error as { code?: string }).code === '23505'
-  );
-}
 
 async function findOwnableProduct(
   id: string,
@@ -121,12 +113,15 @@ export class ProductsService {
       if (isUniqueViolation(error)) {
         throw new AppError(409, 'SKU already exists');
       }
+      if (isForeignKeyViolation(error)) {
+        throw new AppError(400, 'Category not found');
+      }
       throw error;
     } finally {
       client.release();
     }
 
-    await deleteKeysByPattern('search:*');
+    await invalidateProductCaches([]);
 
     return fetchPublicProduct(productId);
   }
@@ -166,13 +161,19 @@ export class ProductsService {
     setClauses.push('updated_at = now()');
     params.push(id);
 
-    await pool.query(
-      `UPDATE products SET ${setClauses.join(', ')} WHERE id = $${params.length}`,
-      params,
-    );
+    try {
+      await pool.query(
+        `UPDATE products SET ${setClauses.join(', ')} WHERE id = $${params.length}`,
+        params,
+      );
+    } catch (error) {
+      if (isForeignKeyViolation(error)) {
+        throw new AppError(400, 'Category not found');
+      }
+      throw error;
+    }
 
-    await redis.del(`product:${id}`);
-    await deleteKeysByPattern('search:*');
+    await invalidateProductCaches([id]);
     await publishEvent(KAFKA_TOPICS.PRODUCT_UPDATED, {
       productId: id,
       sellerId,
@@ -195,8 +196,7 @@ export class ProductsService {
       id,
     ]);
 
-    await redis.del(`product:${id}`);
-    await deleteKeysByPattern('search:*');
+    await invalidateProductCaches([id]);
   }
 }
 

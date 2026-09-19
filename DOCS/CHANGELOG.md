@@ -139,3 +139,28 @@
 - Rewired npm scripts: `"test": "jest"` (was unit-only), `"test:integration": "jest tests/integration"` (was `--passWithNoTests`, no longer needed now that real tests exist), `"test:concurrency": "ts-node scripts/test-concurrency.ts"` (was a Jest placeholder). Removed the now-superseded `tests/concurrency/` placeholder directory from Step 1.
 - Added `.github/workflows/ci.yml`: three sequential jobs (`lint` → `test` → `build`) on push/PR to `main`. `test` runs with `postgres:16-alpine` and `redis:7-alpine` service containers (no Kafka service — the app's Kafka handling is designed to degrade gracefully without one, verified locally with Kafka stopped) and runs `npm run migrate`, `npm run seed`, then `npm test`. `build` runs `tsc --noEmit` and `docker build` against the existing `Dockerfile`.
 - Rewrote `DOCS/HOW-TO-RUN.md` and `DOCS/TESTING-GUIDE.md` in full (see those files).
+
+## [Step 7] - Hardening, Benchmarks & Release
+
+Correctness fixes, each with a test that fails on the code before it:
+
+- Checkout locks the customer's cart row, so a double-submitted checkout creates one order instead of two (measured: two orders in 9 of 10 trials before).
+- A product soft deleted while in a cart now fails the order with `400` instead of being silently dropped from it.
+- Payment processing locks the order and moves the payment out of `pending` with a conditional update, so several payments for one order can no longer all complete.
+- Refunds require a `confirmed` order; cancelling a paid order marks its payment `refunded`.
+- Cancel, refund and delivery lock inventory rows in `product_id` order through `inventory.stock.ts`, the same order checkout uses; the order row is always locked before the payment row.
+- Refresh token rotation consumes the session with one `DELETE … RETURNING`, so a token is single-use under concurrency.
+- The login rate limiter runs as one Lua script, so a burst cannot exceed the limit.
+- A payment key reused for a different order returns `409`.
+- Seed data reserves stock for the seeded open orders, so they can be cancelled and delivered.
+- Setting stock below reserved stock returns `409`, an unknown category `400`, instead of `500`.
+- Cache invalidation after commit is best effort, so a committed write is never reported as a `500`.
+- Search pages are invalidated by incrementing a version counter instead of `SCAN`-ing the Redis keyspace, which made checkout 4–6× slower with 50,000 keys in Redis.
+- `JWT_SECRET` is required in production; unmatched routes share one metrics label; 4xx responses are logged as warnings without stacks.
+
+Cleanup and tooling:
+
+- Shared helpers replace duplicated code: `utils/pgErrors.ts`, `utils/requireUser.ts`, `invalidateProductCaches`.
+- New tests for search and inventory; 54 tests in total.
+- Benchmark suite in `scripts/bench/` with `npm run bench`, recorded results in `scripts/bench/results/`.
+- README rewritten; `DOCS/ARCHITECTURE.md` rewritten as a single top-to-bottom design document.

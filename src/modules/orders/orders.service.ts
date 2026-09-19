@@ -1,5 +1,5 @@
 import { pool } from '../../config/db';
-import { redis, deleteKeysByPattern } from '../../config/redis';
+import { redis, invalidateProductCaches } from '../../config/redis';
 import { publishEvent, KAFKA_TOPICS } from '../../config/kafka';
 import { AppError } from '../../utils/AppError';
 import { UserRole } from '../auth/auth.types';
@@ -13,13 +13,6 @@ const ALLOWED_TRANSITIONS: Partial<Record<OrderStatus, OrderStatus>> = {
 };
 
 const STOCK_RELEASE_TTL_SECONDS = 60 * 60 * 24 * 7;
-
-async function invalidateProductCaches(productIds: string[]): Promise<void> {
-  if (productIds.length > 0) {
-    await redis.del(...productIds.map((productId) => `product:${productId}`));
-  }
-  await deleteKeysByPattern('search:*');
-}
 
 async function fetchOrderItems(orderId: string): Promise<OrderItemDetail[]> {
   const result = await pool.query<{

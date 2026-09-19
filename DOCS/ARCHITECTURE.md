@@ -82,7 +82,7 @@ This codebase answers each one in a form small enough to explain file by file.
 | Brute-force resistance on login | Sliding-window rate limit per IP in Redis; bcrypt cost 12 (§7) |
 | Every log line traceable to one request | Request id held in `AsyncLocalStorage` and added to every log line (§13) |
 | Operational visibility | Prometheus metrics at `/metrics` (§13) |
-| Correctness checked automatically | 41 Jest tests against real Postgres and Redis, including repeated race tests; lint, test, type-check and Docker build in CI (§13) |
+| Correctness checked automatically | 54 Jest tests against real Postgres and Redis, including repeated race tests; lint, test, type-check and Docker build in CI (§13) |
 
 ---
 
@@ -156,6 +156,9 @@ Each of these is excluded deliberately.
 | `payments` module | Initiate, process, refund | `src/modules/payments/` |
 | Consumers | Audit log of every topic; stock release on `order.cancelled` | `src/consumers/index.ts` |
 | `AppError` | An `Error` carrying an HTTP status code | `src/utils/AppError.ts` |
+| `requireUser` | The authenticated user for a controller, narrowed from `req.user` | `src/utils/requireUser.ts` |
+| Constraint helpers | Recognise unique, foreign-key and `CHECK` violations by SQLSTATE | `src/utils/pgErrors.ts` |
+| `invalidateProductCaches` | The one best-effort cache invalidation every write path uses | `src/config/redis.ts` |
 | Request context | `AsyncLocalStorage` holding the request id | `src/utils/requestContext.ts` |
 
 ### Module layout and the dependency rule
@@ -197,7 +200,7 @@ The rules, and where they are broken:
                     validate every line; UPDATE inventory reserved_stock (one statement)
                     INSERT order; INSERT order_items (one statement); DELETE cart_items
                     COMMIT
-                    DEL product:{id}...; SCAN+DEL search:*       Redis
+                    DEL product:{id}...; INCR search:version     Redis, best effort
                     publish order.created                         Kafka, best effort
                     read back the order (3 queries in parallel)
      <- 201 {"order": {...}}
@@ -335,11 +338,15 @@ Every value reaches SQL as a `$n` parameter.
 
 ### Errors
 
-Services throw `AppError(status, message)`. Controllers wrap every call in
+Services throw `AppError(status, message)`. Where the database enforces a rule, the
+service translates the constraint violation into the matching client error using
+`src/utils/pgErrors.ts`: a unique violation becomes `409`, a foreign-key violation on
+`category_id` becomes `400 Category not found`, and the stock `CHECK` violation
+becomes `409` (§8). Controllers wrap every call in
 `try { … } catch (error) { next(error) }`. `errorHandler`:
 
 - uses `err.statusCode`, or `500` if there is none;
-- logs every error with its stack, method and path;
+- logs a `5xx` at `error` level with its stack, method and path, and a `4xx` at `warn` level without a stack. A wrong password or an out-of-stock item is normal operation, not a fault, and must not bury real faults in the log;
 - in production, replaces the message of a `500` with `Internal server error` and omits every stack; outside production, returns both.
 
 ### Status codes used
@@ -347,12 +354,12 @@ Services throw `AppError(status, message)`. Controllers wrap every call in
 | Code | Meaning here |
 | --- | --- |
 | `200`, `201`, `204` | Success; `201` for creation; `204` for a soft delete and for clearing the cart |
-| `400` | A business rule refused the request: empty cart, insufficient stock, illegal status change |
+| `400` | A business rule refused the request: empty cart, insufficient stock, illegal status change, unknown category |
 | `401` | Missing or invalid access token; bad credentials; bad refresh token |
 | `402` | Simulated payment failure |
 | `403` | Wrong role, or not the owner of the resource |
 | `404` | Missing resource |
-| `409` | Duplicate email or SKU; a payment key reused for a different order |
+| `409` | Duplicate email or SKU; a payment key reused for a different order; total stock set below reserved stock |
 | `422` | Input failed schema validation |
 | `429` | Rate limited, with `Retry-After` |
 
@@ -460,7 +467,7 @@ millisecond timestamps. The steps run as one Lua script (`EVAL`):
 
 | Operation | Behaviour |
 | --- | --- |
-| Create | One transaction inserts the product and its `inventory` row (stock 0, threshold 10), so a product never exists without stock data; a duplicate SKU is `409` |
+| Create | One transaction inserts the product and its `inventory` row (stock 0, threshold 10), so a product never exists without stock data; a duplicate SKU is `409`, an unknown category `400` |
 | Update | Owner only; builds `SET` from the fields present; publishes `product.updated` |
 | Delete | Owner only; soft delete |
 | List | Paginated by `page` and `limit` (at most 100), newest first; not cached |
@@ -504,7 +511,7 @@ A search runs two queries, a `COUNT(*)` and the page, so the response can report
 
 ### Inventory endpoints
 
-- `PUT /inventory/:productId { totalStock }` sets on-hand stock. The `CHECK` constraint rejects a value below `reserved_stock`. If the result leaves `available <= low_stock_threshold`, it publishes `inventory.updated` with the full snapshot, so a consumer does not need to query again.
+- `PUT /inventory/:productId { totalStock }` sets on-hand stock. A value below `reserved_stock` violates the `CHECK` constraint and is returned as `409`: open orders already hold that stock. If the result leaves `available <= low_stock_threshold`, it publishes `inventory.updated` with the full snapshot, so a consumer does not need to query again.
 - `GET /inventory/low-stock` lists products at or below their threshold, most urgent first; a seller sees only their own.
 
 Only the explicit stock update checks the threshold. Checkout lowering
@@ -530,7 +537,8 @@ Cache-aside: the service reads Redis first and falls back to Postgres.
 | Key | Value | TTL | Filled by |
 | --- | --- | --- | --- |
 | `product:{id}` | One `PublicProduct` | 600 s | `GET /products/:id` |
-| `search:{md5}` | One page of results plus pagination | 300 s | `GET /search` |
+| `search:version` | An integer, the current search cache version | none | Every write that changes products or stock |
+| `search:v{version}:{md5}` | One page of results plus pagination | 300 s | `GET /search` |
 | `ratelimit:{route}:{ip}` | Sorted set of timestamps | the window | Rate limiter (§7) |
 | `order:stock-released:{orderId}` | `1`, a claim flag | 7 days | Cancellation (§12) |
 
@@ -545,7 +553,7 @@ strings before caching, so a hit and a miss return identical JSON.
 
 ### Invalidation
 
-| Write | Deletes `product:{id}` | Deletes all `search:*` |
+| Write | Deletes `product:{id}` | Increments `search:version` |
 | --- | --- | --- |
 | Create product | — | yes |
 | Update product | yes | yes |
@@ -563,16 +571,47 @@ re-running each query, which is the cost the cache exists to avoid. Writes are
 rare compared with reads, so a brief cold search cache after each write is the
 cheaper price for never showing a stale price or stock count.
 
-**How.** `deleteKeysByPattern` iterates with `SCAN … MATCH search:* COUNT 100`
-and deletes each batch. `KEYS` would block Redis, which is single-threaded, for
-the whole scan. The cost is still proportional to the whole keyspace, not to the
-matching keys, and it is paid on every order (§16).
+**How: a version number, not deletion.** Every search key contains the current
+value of `search:version`. Invalidation is one `INCR` of that counter: every page
+cached under the old version becomes unreachable at once and expires with its
+300 s TTL.
+
+```
+  search(query)                               write (order, stock change, product edit)
+  1. v = GET search:version                   COMMIT
+  2. GET search:v{v}:{md5(query)}             DEL product:{id}...
+       hit  -> return                         INCR search:version      O(1)
+  3. miss -> query Postgres
+  4. SET search:v{v}:{md5(query)} EX 300
+```
+
+The first design deleted the pages instead, with
+`SCAN … MATCH search:* COUNT 100` followed by `DEL` (`KEYS` would block Redis,
+which is single-threaded, for the whole scan). `SCAN` visits every key in Redis,
+not just the matching ones, so every checkout, cancellation and product edit paid
+for the whole keyspace, including every cached product and rate-limit set. §15
+measures it: with 50,000 unrelated keys in Redis, checkout throughput fell to
+16–26% of normal. With the counter, a write costs the same whatever Redis holds.
+Search hits cost one extra round trip, to read the version.
+
+The version also closes a race. A search that misses reads the version *before*
+querying Postgres. If a write commits while that query runs, the page is stored
+under the old version and is never served.
+
+### Invalidation is best effort
+
+`invalidateProductCaches(productIds)` in `src/config/redis.ts` is the single place
+every write path, and the `InventoryConsumer`, invalidates through. It runs after
+the transaction has committed, so it never fails the request. If Redis is
+unreachable it logs the error and returns, and the client gets the `201` or `200`
+its committed change deserves. Failing instead used to return a `500` for an order
+that existed, and the client's retry then found an empty cart. The cost is that
+entries which could not be invalidated stay until their TTL.
 
 ### What the cache does not guarantee
 
-- **A read racing a write can re-cache old data.** A miss reads the old row; the write commits and deletes the key; the miss then writes the old value back. It stays until the TTL expires. The window is one database round trip wide.
-- **Redis is on the request path.** A cache read that fails is not caught, so the request fails instead of falling back to Postgres (§17).
-- **Cache writes after commit can fail** after the database change has already committed. The client then gets a `500` for a write that took effect (§17).
+- **A product read racing a write can re-cache old data.** A miss reads the old row; the write commits and deletes `product:{id}`; the miss then writes the old value back. It stays until the TTL expires. The window is one database round trip wide. Search pages are not affected, because of the version.
+- **Redis is on the read path.** A cache read that fails is not caught, so the lookup fails instead of falling back to Postgres (§17).
 
 ---
 
@@ -627,7 +666,7 @@ statements could not share a transaction.
   7. DELETE FROM cart_items WHERE cart_id = $1
   COMMIT
   --- after commit ---
-  8. invalidate product:{id} for each line, and search:*
+  8. invalidate product:{id} for each line; bump the search version
   9. publish order.created
   10. read the order back and return it
 ```
@@ -990,16 +1029,17 @@ would create a new series for every distinct unknown URL anyone sends.
 | `tests/unit/health.test.ts` | `/health` shape | 1 |
 | `tests/integration/auth.test.ts` | Register, duplicate, validation, login, refresh, logout, concurrent refresh | 9 |
 | `tests/integration/rateLimit.test.ts` | A burst of 15 logins admits exactly 5 | 1 |
-| `tests/integration/products.test.ts` | List, get, RBAC, ownership, soft delete | 7 |
+| `tests/integration/products.test.ts` | List, get, RBAC, ownership, soft delete, unknown category | 8 |
+| `tests/integration/search.test.ts` | Full-text match, stemming, filters, sort, no stale page after an update, sort-column validation | 6 |
+| `tests/integration/inventory.test.ts` | Set stock, stock below reservations, low-stock list, customer forbidden | 4 |
 | `tests/integration/cart.test.ts` | Add, stock limit, unavailable, update, remove, clear | 6 |
-| `tests/integration/orders.test.ts` | Place, empty cart, insufficient stock, cancel, lifecycle, double submit, deleted product | 8 |
+| `tests/integration/orders.test.ts` | Place, empty cart, insufficient stock, cancel, lifecycle, double submit, deleted product, seeded orders, cache failure after commit | 10 |
 | `tests/integration/payments.test.ts` | Initiate, idempotent retry, process, refund, refund after shipping, cancel refunds, key reuse, concurrent processing | 8 |
 | `tests/integration/concurrency.test.ts` | 10 simultaneous checkouts for 3 units | 1 |
 
 A race shows up only some of the time, so the double-submit, concurrent-refresh
-and concurrent-processing tests each repeat 10 independent trials. All three
-fail against the code before the fixes described in §7, §10 and §11, and pass
-after them.
+and concurrent-processing tests each repeat 10 independent trials. Every test
+written for a fix was run against the code before that fix and failed there.
 
 Integration tests run the real app in process through `supertest`, against a
 real Postgres and Redis. `tests/setup.ts` creates `ecommerce_test` if missing,
@@ -1017,24 +1057,36 @@ containers, `migrate`, `seed`, `npm test`) → `build` (`tsc --noEmit`,
 
 ## 14. Benchmark methodology
 
+### Running
+
+```bash
+npm run bench            # RUNS=5 npm run bench for five runs of the timing benchmarks
+```
+
+`scripts/bench/run-all.sh` builds the app, refuses to start if something already
+answers on the port, starts a production server, runs every benchmark, writes the
+raw output to `scripts/bench/results/`, and stops the server. It records the
+machine, OS, Node, Postgres and Redis versions, the git commit, the number of
+uncommitted source files and the load average in `environment.txt`. Results in
+`results/one-off/` are experiments run by hand, and the runner never deletes them.
+
 ### Benchmarks
 
 | Script | Measures |
 | --- | --- |
-| `scripts/bench/cache.ts` | `GET /products/:id` latency and throughput, cache miss against cache hit, sequential and 50 in flight, over an 8,000-product catalog |
-| `scripts/bench/throughput.ts` | `POST /orders` throughput, 1 in flight against 32, with orders spread across products and with all on one product |
-| `scripts/bench/oversell.ts` | 200 buyers, 50 units, 64 in flight: orders confirmed, units reserved |
-| `scripts/bench/deadlock.ts` | 200 five-item carts over 20 shared products, half in reverse order, 32 in flight |
+| `cache.ts` | `GET /products/:id` latency and throughput, cache miss against cache hit, sequential and 50 in flight, over an 8,000-product catalog |
+| `throughput.ts` | `POST /orders` throughput, 1 in flight against 32, with orders spread across products and with all on one product |
+| `checkout.ts` | `POST /orders` latency with five-item carts, sequential and 32 in flight, then the deadlock probe |
+| `oversell.ts` | 200 buyers, 50 units, 64 in flight: orders confirmed, units reserved |
+| `deadlock.ts` | 200 five-item carts over 20 shared products, half in reverse order, 32 in flight |
+| `double-submit.ts` | One customer sending two checkouts at once, 10 trials |
 
-Further runs, whose output is in `scripts/bench/results/`, test specific
-suspicions from reading the code:
-
-| Run | Output |
+| One-off experiment (`results/one-off/`) | Question |
 | --- | --- |
-| One customer, two simultaneous checkouts, 10 trials, after the fix | `double-submit.txt` |
-| The same probe before the fix | `before-fixes/double-submit.txt` |
-| Refund of a payment whose order was already delivered, before the fix | `before-fixes/refund-after-delivery.txt` |
-| `throughput.ts` with and without the cart row lock, alternating | `ab-cart-lock.txt` |
+| `keyspace-size-before-fix.txt`, `keyspace-size-after-fix.txt` | Does checkout slow down as Redis holds more keys? |
+| `ab-cart-lock.txt` | What does the cart row lock cost? |
+| `double-submit-before-fix.txt` | How often did a double submit create two orders before the cart lock? |
+| `refund-after-delivery-before-fix.txt` | What did refunding a delivered order do before refunds checked order status? |
 
 ### Rules
 
@@ -1045,19 +1097,20 @@ suspicions from reading the code:
 | Fixtures are inserted straight into Postgres before timing | Setup is not part of what is measured |
 | Every buyer has their own user and cart; tokens are signed directly | Login rate limits would otherwise cap the run |
 | Each cache sample uses a never-requested id for the miss, then the same id for the hit | The two arms do identical work apart from the cache |
-| A warm-up before measuring (50 lookups; 1 order) | JIT compilation and pool growth are not charged to the first arm |
+| A warm-up before measuring (50 lookups; 1 order; 25 checkouts) | JIT compilation and pool growth are not charged to the first arm |
 | Throughput from the wall time of the whole run | Not limited by timer resolution |
 | `cache.ts` and `throughput.ts` run three times; medians reported with ranges | One run on a laptop proves little |
-| Bench rows are deleted afterwards | The dev database is left as it was |
+| Bench rows and their cache entries are deleted afterwards | The dev database is left as it was, and one benchmark's 8,000 cached products do not linger into the next |
+| Experiments alternate their arms (A, B, A, B) | Machine drift over a session is larger than some effects measured |
 
 ### Limits of the measurements
 
-- **One machine, not isolated.** Client, server, Postgres and Redis share a laptop's cores; load average at the start was 3.19. Separate sessions on the same machine differ by more than some of the effects measured (§15).
+- **One machine, not isolated.** Client, server, Postgres and Redis share a laptop's cores; the load average at the start was 4.02. Separate sessions on the same machine differ by more than some of the effects measured.
 - **Loopback only.** No real network latency between the app and its clients or its databases. Over a network each round trip costs more, which favours the cache and penalises multi-query endpoints more than these numbers show.
 - **The Postgres pool has 10 connections** (the `pg` default; `db.ts` sets no `max`). Every concurrent arm has more requests in flight than connections, so they also measure queueing for a connection.
 - **Small data.** At most 8,000 products; everything fits in Postgres's buffer cache.
-- **`oversell.ts` and `deadlock.ts` ran once.** They check correctness, not speed, and their outcomes are counts.
-- **`scripts/bench/checkout.ts` was not run.** It starts with `FLUSHALL`, which would erase the whole development Redis instance.
+- **Single runs for counts.** `oversell.ts`, `deadlock.ts`, `double-submit.ts` and `checkout.ts` ran once; the first three check correctness and their outcomes are counts.
+- **The benchmarks share the development database and Redis.** They clean up after themselves but do not reset anything first.
 
 ---
 
@@ -1065,22 +1118,23 @@ suspicions from reading the code:
 
 Every number here is taken from `scripts/bench/results/`. The machine is an
 Apple M2 Pro (12 cores) with 16 GB of RAM, running macOS 26.5.2, Node
-v25.8.2, PostgreSQL 16.14 and Redis 8.6.2, all local. The code is commit
-`8a8a271` plus the uncommitted changes listed in `environment.txt`: the sorted
-lock order and batched statements in checkout, and the fixes described in §7,
-§10 and §11. Timing figures are medians of three runs.
+v25.8.2, PostgreSQL 16.14 and Redis 8.6.2, all local. `environment.txt` records
+commit `fe40cb2` plus 18 uncommitted source files: the code of the commit that
+added these results. Timing figures are medians of three runs.
 
 ### Summary
 
 | Measurement | Result |
 | --- | --- |
-| `GET /products/:id`, one at a time | hit 0.28 ms, miss 0.56 ms mean; −59.3% median per-run change |
-| `GET /products/:id`, 50 in flight | hit 18,453, miss 9,757 req/s; +76.1% median per-run gain |
-| Checkout throughput, 32 in flight, no shared products | 1,523.3 orders/s (10.18× one at a time) |
-| Checkout throughput, 32 in flight, every order on one product | 911.5 orders/s (6.35× one at a time) |
+| `GET /products/:id`, one at a time | hit 0.24 ms, miss 0.56 ms mean; −57.9% median per-run change |
+| `GET /products/:id`, 50 in flight | hit 16,922, miss 10,181 req/s; +76.7% median per-run gain |
+| Checkout throughput, 32 in flight, no shared products | 1,719.5 orders/s (8.76× one at a time) |
+| Checkout throughput, 32 in flight, every order on one product | 1,360.4 orders/s (2.52× one at a time) |
+| Checkout of a five-item cart | 6.25 ms mean one at a time; 17.59 ms with 32 in flight |
 | 200 buyers for 50 units | 50 confirmed, 150 rejected with `400`, 0 errors, 0 oversold |
-| 200 overlapping carts in opposite lock orders | 200 of 200 succeeded, no deadlocks |
+| 200 overlapping carts in opposite lock orders | 200 of 200 succeeded, no deadlocks, in both probes |
 | One customer, two simultaneous checkouts | one order in 10 of 10 trials (before the fix: two orders in 9 of 10) |
+| Checkout with 50,000 extra keys in Redis | no measurable change (before the fix: 4–6× slower) |
 | Cost of the cart row lock | none measurable |
 
 ### Product lookup: cache against database
@@ -1089,27 +1143,27 @@ lock order and batched statements in checkout, and the fixes described in §7,
 
 | Arm | Mean | p50 | p95 | p99 |
 | --- | ---: | ---: | ---: | ---: |
-| Miss (Postgres) | 0.56 ms | 0.54 ms | 0.77 ms | 1.07 ms |
-| Hit (Redis) | 0.28 ms | 0.24 ms | 0.35 ms | 1.13 ms |
+| Miss (Postgres) | 0.56 ms | 0.53 ms | 0.75 ms | 1.34 ms |
+| Hit (Redis) | 0.24 ms | 0.22 ms | 0.36 ms | 0.51 ms |
 
-Mean latency fell by 64.6%, 59.3% and 50.0% in the three runs.
+Mean latency fell by 47.3%, 58.9% and 57.9% in the three runs.
 
 2,000 requests, 50 in flight:
 
 | Arm | req/s | Mean | p50 | p95 | p99 |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| Miss (Postgres) | 9,757 | 5.06 ms | 4.36 ms | 8.98 ms | 11.18 ms |
-| Hit (Redis) | 18,453 | 2.67 ms | 2.45 ms | 5.96 ms | 7.24 ms |
+| Miss (Postgres) | 10,181 | 4.82 ms | 4.27 ms | 8.66 ms | 14.37 ms |
+| Hit (Redis) | 16,922 | 2.91 ms | 2.53 ms | 5.93 ms | 7.69 ms |
 
-Throughput gain per run: +92.9%, +76.1%, +65.9%.
+Throughput gain per run: +86.4%, +59.2%, +76.7%.
 
 What the data shows:
 
 - **A hit is about 0.3 ms cheaper than a miss** on loopback. The miss is one indexed query joining four tables plus a Redis `SET`; the hit is one Redis `GET`.
-- **The difference matters more under load.** With 50 requests in flight and 10 database connections, misses queue for a connection; hits never take one. Throughput nearly doubles.
-- **A hit is not free.** It still costs about 0.25 ms. The benchmark does not split that between HTTP handling, middleware, JSON and the Redis round trip.
-- **Tails are noisy.** The sequential hit p99 (1.13 ms) is above the miss p99 (1.07 ms); across runs the hit p99 ranged from 0.50 ms to 1.33 ms and the miss p99 from 0.83 ms to 2.69 ms. With 200 samples, p99 is the second-slowest request, so one scheduling hiccup moves it.
-- **Per-run changes and ratios of medians differ.** The medians in the tables give 9,757 → 18,453 req/s (+89%), but the three paired runs gave +92.9%, +76.1% and +65.9%; the summary uses the median paired change.
+- **The difference matters more under load.** With 50 requests in flight and 10 database connections, misses queue for a connection; hits never take one.
+- **A hit is not free.** It still costs about 0.24 ms. The benchmark does not split that between HTTP handling, middleware, JSON and the Redis round trip.
+- **Tails are noisy.** Across runs the sequential miss p99 ranged from 0.79 ms to 1.91 ms and the hit p99 from 0.45 ms to 1.54 ms. With 200 samples, p99 is the second-slowest request, so one scheduling hiccup moves it.
+- **Per-run changes and ratios of medians differ.** The medians in the tables give 10,181 → 16,922 req/s (+66%), but the three paired runs gave +86.4%, +59.2% and +76.7%; the summary uses the median paired change.
 
 ### Checkout throughput
 
@@ -1118,45 +1172,73 @@ first buyer is the warm-up):
 
 | Arm | orders/s | Mean | p50 | p95 | p99 |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| Spread, 1 in flight | 131.1 | 7.63 ms | 7.41 ms | 9.43 ms | 13.57 ms |
-| Spread, 32 in flight | 1,523.3 | 20.35 ms | 19.02 ms | 33.82 ms | 37.72 ms |
-| One product, 1 in flight | 142.5 | 7.01 ms | 7.06 ms | 8.72 ms | 16.36 ms |
-| One product, 32 in flight | 911.5 | 34.04 ms | 28.47 ms | 62.30 ms | 83.71 ms |
+| Spread, 1 in flight | 195.1 | 5.12 ms | 4.53 ms | 8.73 ms | 12.33 ms |
+| Spread, 32 in flight | 1,719.5 | 17.91 ms | 14.79 ms | 44.52 ms | 47.40 ms |
+| One product, 1 in flight | 540.9 | 1.85 ms | 1.64 ms | 3.05 ms | 3.75 ms |
+| One product, 32 in flight | 1,360.4 | 22.74 ms | 20.26 ms | 38.43 ms | 51.40 ms |
 
 Each cell is the median across the three runs, taken per column.
 
 | Speed-up of 32 in flight over 1 | Run 1 | Run 2 | Run 3 | Median |
 | --- | ---: | ---: | ---: | ---: |
-| Spread | 8.78× | 11.62× | 10.18× | 10.18× |
-| One product | 4.53× | 6.35× | 6.40× | 6.35× |
+| Spread | 8.76× | 7.63× | 10.53× | 8.76× |
+| One product | 2.44× | 2.52× | 3.54× | 2.52× |
 
 What the data shows:
 
-- **A checkout takes about 7 ms end to end** when nothing else is running: around ten round trips to Postgres, a Redis delete, a `SCAN` of the Redis keyspace and a Kafka publish.
-- **Concurrency multiplies throughput about tenfold** when orders do not share products, while each order waits under three times longer. The likely reason is that most of a checkout is spent waiting on round trips, and those overlap across requests.
-- **A hot product costs a third of the throughput.** Concurrent throughput on a single inventory row was 37.5% below spread orders (median; the three runs ranged from −27.3% to −41.5%), and its p99 more than doubled. Every checkout of that product waits its turn for one row lock.
-- **The data does not isolate the ceiling.** The concurrent arms queue for 10 pool connections, share cores with Postgres and the client, and scan the Redis keyspace on every order. Separating those would need profiling that was not done.
+- **Concurrency multiplies throughput about ninefold** when orders do not share products. The likely reason is that most of a checkout is spent waiting on round trips to Postgres and Redis, and those overlap across requests.
+- **A hot product serialises.** With 32 in flight, every order on one product was 31.0% below spread orders (median; the three runs ranged from −19.1% to −38.9%). Each of those checkouts waits its turn for one inventory row lock.
+- **One at a time, the hot product was faster.** A sequential checkout of the same product took 1.85 ms against 5.12 ms for a different product each time. The data does not explain why. One difference is that the spread arm touches 300 different product and inventory rows, the hot arm one.
+- **The data does not isolate the ceiling.** The concurrent arms queue for 10 pool connections and share cores with Postgres and the client. Separating those would need profiling that was not done.
 - Every order in every throughput run succeeded.
+
+`checkout.ts`, five-item carts, one run:
+
+| Arm | Mean | p50 | p95 | p99 |
+| --- | ---: | ---: | ---: | ---: |
+| Sequential, 250 checkouts | 6.25 ms | 5.84 ms | 10.96 ms | 13.60 ms |
+| 32 in flight, 250 checkouts | 17.59 ms | 16.16 ms | 31.59 ms | 34.93 ms |
+
+No checkout failed. Reserving stock and inserting order lines are one statement
+each whatever the cart size (§10), and a five-item checkout (6.25 ms mean) cost
+close to a one-item checkout of distinct products (5.12 ms) in the throughput
+runs. This is a single run, from a separate benchmark.
+
+### Redis keyspace size
+
+`throughput.ts` with the normal development keyspace (about 20 keys) and with
+50,000 extra, unrelated keys, alternating. 32 in flight, orders/s:
+
+| | Normal keyspace | 50,000 extra keys |
+| --- | --- | --- |
+| Before the fix, spread | 1,919.9 and 2,162.4 | 349.4 and 346.3 |
+| Before the fix, one product | 1,420.9 and 1,347.1 | 345.2 and 345.7 |
+| After the fix, spread | 1,481.2 and 1,671.2 | 1,775.5 and 2,107.1 |
+| After the fix, one product | 1,184.1 and 1,173.5 | 1,045.7 and 1,187.7 |
+
+Before the fix, every checkout ran `SCAN … MATCH search:*` over the whole
+keyspace to invalidate search pages. With 50,000 keys that cut throughput by
+74–84%, to about 346 orders/s whatever the product mix: the scan, not the
+database, set the pace. One at a time, a checkout slowed from about 4.4–4.9 ms to
+about 20 ms (204.2 and 228.3 against 50.3 and 51.6 orders/s). After replacing the
+scan with a version counter (§9), the 50,000 keys make no measurable difference.
+Production Redis holds every cached product and rate-limit set, so the keyspace
+grows with the catalog and the traffic.
 
 ### Cost of the cart row lock
 
-The cart lock added in §10 changes the checkout path, so it was measured
-separately. `ab-cart-lock.txt` runs `throughput.ts` four times, alternating
-between two builds that differ only in that one statement:
+`one-off/ab-cart-lock.txt` runs `throughput.ts` four times, alternating between
+two builds that differ only in the cart `FOR UPDATE`:
 
 | 32 in flight | Without lock | With lock |
 | --- | --- | --- |
 | Spread | 1,110.6 and 1,160.4 orders/s | 1,182.8 and 1,225.1 orders/s |
 | One product | 1,077.4 and 1,150.0 orders/s | 1,144.3 and 1,190.2 orders/s |
 
-The runs with the lock were no slower. This is expected: carts belong to one
-customer, and each buyer in the benchmark has their own, so the lock is never
-contended.
-
-The same session also shows how much the machine varies. The one-product arm
-ran at 891–975 orders/s in the three main runs and at 1,077–1,190 orders/s in
-the A/B runs minutes later, with the same code. Differences of that size
-between sessions are noise, not an effect of the code.
+The runs with the lock were no slower. Carts belong to one customer, and each
+buyer in the benchmark has their own, so the lock is never contended. This
+experiment ran before the search invalidation fix, so its absolute numbers are
+not comparable with the tables above; only the with/without comparison matters.
 
 ### Correctness under concurrency
 
@@ -1170,29 +1252,25 @@ Exactly the stock was sold. Every rejection was a `400` and none was a `5xx`. A
 `CHECK` violation would have surfaced as a `500`, so the row lock turned the
 losers away, not the backstop.
 
-`deadlock.ts`, 200 buyers with five items each from a pool of 20 products, even
-and odd buyers holding the same items in opposite orders, 32 in flight:
-
-| Succeeded | Deadlocks or other errors |
-| ---: | ---: |
-| 200 | 0 |
-
-This run covers only the code with sorted locks. No comparison run without the
-`ORDER BY` was made.
+`deadlock.ts`, and the probe at the end of `checkout.ts`: 200 buyers each, with
+five items from a pool of 20 products, even and odd buyers holding the same items
+in opposite orders, 32 in flight. Both probes: 200 of 200 succeeded, no
+deadlocks. These runs cover only the code with sorted locks; no comparison run
+without the `ORDER BY` was made.
 
 One customer, two simultaneous `POST /orders`, 10 trials:
 
 | | Trials with one order | Trials with two orders |
 | --- | ---: | ---: |
-| Before the fix (`before-fixes/double-submit.txt`) | 1 | 9 |
+| Before the fix (`one-off/double-submit-before-fix.txt`) | 1 | 9 |
 | After the fix (`double-submit.txt`) | 10 | 0 |
 
 After the fix, every trial returned one `201` and one `400`, with the cart's 2
 units reserved once.
 
-`before-fixes/refund-after-delivery.txt`: before the fix, refunding a payment
-whose order was already delivered returned `500`. The release would have taken
-`reserved_stock` below zero, so the `CHECK` constraint rejected it and the
+`one-off/refund-after-delivery-before-fix.txt`: before the fix, refunding a
+payment whose order was already delivered returned `500`. The release would have
+taken `reserved_stock` below zero, so the `CHECK` constraint rejected it and the
 transaction rolled back. The same request is now refused with `400` before any
 stock is touched; a test covers the shipped case.
 
@@ -1204,12 +1282,12 @@ stock is touched; a test covers the shipped case.
 | --- | --- | --- |
 | Raw SQL through `pg`, no ORM | Every query is visible; locking and `unnest` batching are explicit | Hand-written mapping; conventions such as `is_deleted = false` repeated in every query |
 | `reserved_stock` beside `total_stock` | Cancellation and refund are exact inverses; physical stock changes only on delivery | Two counters to keep consistent; stock is held by unpaid orders with no expiry |
-| Pessimistic row locks at checkout | Overselling impossible; a clean `400` for the loser | Checkouts of one product run one at a time through the lock; 37.5% lower throughput for a single hot product (§15) |
+| Pessimistic row locks at checkout | Overselling impossible; a clean `400` for the loser | Checkouts of one product run one at a time through the lock; 31.0% lower concurrent throughput for a single hot product (§15) |
 | `READ COMMITTED` with `FOR UPDATE` | No serialisation failures to retry | Correctness depends on locking the right rows, in a consistent order; a missed lock is a silent race, as the cart was (§10) |
 | Stateless JWT access tokens | No database read per request | Role changes and deactivation take effect only when the token expires |
 | Opaque refresh tokens in a table | Revocable; single use, even under concurrency | A database write per refresh |
-| Cache-aside with blanket `search:*` invalidation | Simple and never stale after a write completes | Every write scans the whole Redis keyspace; search is cold after each write |
-| Redis on the request path without fallback | Simple code | A Redis outage takes down cached reads, rate-limited routes and writes that invalidate (§17) |
+| Cache-aside; all search pages invalidated by one version counter | O(1) invalidation whatever Redis holds; search never stale after a write completes | Search is cold after every product or stock change; a hit costs an extra round trip to read the version |
+| Redis on the read path without fallback | Simple code | A Redis outage takes down cached reads and the rate-limited auth routes (§17) |
 | Best-effort events after commit | Requests never fail because of Kafka | Events can be lost; no ordering per order |
 | Consumers in the web process | One thing to deploy | A consumer problem shares CPU and memory with request handling |
 | Client-chosen payment key, server-derived amount | Safe retries; amount cannot change | A failed payment needs a new key |
@@ -1227,7 +1305,8 @@ stock is touched; a test covers the shipped case.
 | The same customer submits checkout twice at once | The second waits on the cart row lock, then gets `400 Cart is empty` (§15) |
 | A cart line whose product has been soft deleted | The whole order is refused with `400`; nothing is reserved |
 | Any statement fails mid-transaction | `ROLLBACK`; nothing from the transaction is visible; the connection is released |
-| Stock set below current reservations | `CHECK` violation; the update is rejected with `500` |
+| Stock set below current reservations | `CHECK` violation, returned as `409`; nothing changes |
+| Product created or moved into a category that does not exist | Foreign-key violation, returned as `400 Category not found` |
 | Refund of an order already shipped or delivered | `400`; only `confirmed` orders can be refunded |
 | Cancelling a `confirmed` (paid) order | Order cancelled, stock released, payment marked `refunded` |
 | Concurrent `process` calls for one order, on one or several payments | Serialised by the order row lock; at most one payment completes, the others get `400` |
@@ -1235,11 +1314,11 @@ stock is touched; a test covers the shipped case.
 | A burst of concurrent login attempts | Exactly 5 are admitted; the Lua script makes the check atomic |
 | A payment key reused for a different order | `409` |
 | The app runs behind a proxy | `trust proxy` is not set, so `req.ip` is the proxy's address and every client shares one limit |
-| Redis unreachable | Cached reads, login and register fail with `500`; writes commit in Postgres, then return `500` when cache invalidation fails, so a retried checkout reports `Cart is empty` |
+| Redis unreachable | Product lookups, searches, login and register fail with `500` once the Redis client gives up retrying. Writes commit and succeed; their cache invalidation is logged and skipped, so entries it missed live until their TTL. Cancellation is the exception: it must record the stock-release claim (§12), so it returns `500` after committing, and does not publish `order.cancelled` |
 | Kafka unreachable | Each publish waits for a failed connection attempt (2 s timeout, one retry), logs, and continues; requests succeed, slower; events are lost |
 | Kafka unreachable at startup | Consumers fail to start, the error is logged, the server keeps serving, and they are not retried |
 | Crash between `COMMIT` and publish | The order exists; its event was never sent |
-| A cached read races a write | Stale data can be cached for up to the TTL (600 s product, 300 s search) |
+| A product lookup races a write | The old product can be re-cached for up to its 600 s TTL; search pages cannot, because of the version (§9) |
 | `JWT_SECRET` not set | In production the process refuses to start; elsewhere tokens are signed with `change-me` |
 | Anyone registers with `role: admin` | Accepted; there is no approval step |
 | Requests to many unknown URLs | All counted under one `route="unmatched"` label |
@@ -1255,14 +1334,13 @@ stock is touched; a test covers the shipped case.
 In order of expected value, based on §15 and §17.
 
 1. **Outbox for events.** Write each event to a table in the same transaction as the change, and publish from there. No event is lost by a crash or an outage.
-2. **Degrade when Redis is down.** Catch cache errors and fall back to Postgres; never fail a committed write because invalidation failed.
-3. **Cheaper search invalidation.** A version number in the search key (`search:v{n}:{hash}`), incremented on write, replaces the keyspace scan with one `INCR`.
-4. **Reservation expiry.** Release stock held by `pending` orders after a timeout, so unpaid carts cannot hold stock indefinitely.
-5. **A returns flow.** Refunds are limited to orders that have not shipped (§11). Shipped and delivered orders need a return that puts stock back into `total_stock` when the goods arrive.
-6. **Security hardening.** Hash refresh tokens at rest, stop accepting `role` at registration, and set `trust proxy` for deployment behind a load balancer.
-7. **Money as integer cents** end to end.
-8. **Graceful shutdown.** Stop accepting connections, finish in-flight requests, disconnect consumers and the producer, and close the pool.
-9. **Better measurement.** Size the connection pool from measurements, profile the concurrent checkout ceiling, and run the benchmarks on a separate machine over a real network.
+2. **Read through Redis outages.** Treat a failed cache read as a miss, with a short client timeout, so product lookups and search fall back to Postgres. Writes already survive an outage.
+3. **Reservation expiry.** Release stock held by `pending` orders after a timeout, so unpaid carts cannot hold stock indefinitely.
+4. **A returns flow.** Refunds are limited to orders that have not shipped (§11). Shipped and delivered orders need a return that puts stock back into `total_stock` when the goods arrive.
+5. **Security hardening.** Hash refresh tokens at rest, stop accepting `role` at registration, and set `trust proxy` for deployment behind a load balancer.
+6. **Money as integer cents** end to end.
+7. **Graceful shutdown.** Stop accepting connections, finish in-flight requests, disconnect consumers and the producer, and close the pool.
+8. **Better measurement.** Size the connection pool from measurements, profile the concurrent checkout ceiling, and run the benchmarks on a separate machine over a real network.
 
 ---
 
@@ -1322,17 +1400,20 @@ A fixed window allows twice the limit across a boundary. A sorted set of
 timestamps pruned on every request always counts the last N minutes.
 
 **How is the cache kept consistent?**
-Every write that changes a cached product deletes its key and all search keys
-after committing. Remaining staleness comes from a read racing a write, bounded
-by the TTL.
+Every write that changes a cached product deletes its key and increments the
+search version after committing. Remaining staleness comes from a product read
+racing a write, bounded by the TTL.
 
 **Why invalidate every search key instead of the affected ones?**
 Knowing which cached result pages contain a product would mean re-running those
 queries. Writes are rare, so a cold search cache after a write is cheaper.
 
-**Why `SCAN` instead of `KEYS`?**
-`KEYS` blocks single-threaded Redis for the whole scan. `SCAN` works in small
-batches. It still visits every key, so it gets slower as the keyspace grows.
+**How do you invalidate every search page cheaply?**
+Put a version number in every search key and increment it on write. The first
+design deleted `search:*` with `SCAN`, which avoids blocking Redis the way `KEYS`
+does, but still visits every key in Redis on every write. With 50,000 unrelated
+keys that made checkout 4–6 times slower. The counter is one `INCR`, and pages
+under old versions expire by TTL.
 
 **Why `plainto_tsquery`?**
 It accepts arbitrary search-box text. `to_tsquery` expects operator syntax and
@@ -1352,8 +1433,9 @@ Publishing fails fast, is logged and is skipped; requests succeed and the events
 are lost. Postgres remains the record.
 
 **What happens if Redis is down?**
-Cached reads and the rate-limited auth routes fail, and writes commit but return
-errors when invalidation fails. This is the most important resilience gap.
+Writes still succeed: invalidation after commit is best effort. Product lookups,
+search and the rate-limited auth routes fail, because cache reads have no
+fallback. That read path is the most important resilience gap left.
 
 **What happens if a customer double-clicks "Place order"?**
 Both requests lock the customer's cart row first, so they run one after the

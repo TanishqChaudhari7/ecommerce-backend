@@ -125,4 +125,20 @@ describe('Products API', () => {
     const getResponse = await request(app).get(`/api/v1/products/${productId}`);
     expect(getResponse.status).toBe(404);
   });
+
+  it('POST /products with an unknown category returns 400', async () => {
+    const sellerToken = await getSellerToken();
+
+    const response = await request(app)
+      .post('/api/v1/products')
+      .set('Authorization', `Bearer ${sellerToken}`)
+      .send({
+        name: 'Orphan Product',
+        price: 5,
+        sku: `ORPHAN-${Date.now()}`,
+        categoryId: '00000000-0000-4000-8000-000000000000',
+      });
+
+    expect(response.status).toBe(400);
+  });
 });

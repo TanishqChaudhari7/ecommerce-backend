@@ -1,10 +1,8 @@
 /**
  * Metric C - checkout (POST /api/v1/orders) latency, plus a deadlock probe.
  *
- * Run once against the current code for a baseline, then again after optimizing
- * placeOrder. Carts hold ITEMS_PER_CART items because the per-item work in placeOrder
- * (one UPDATE inventory and one INSERT order_items per item, each its own round trip)
- * is what the optimization targets - a single-item cart would hide it.
+ * Carts hold ITEMS_PER_CART items so that per-item work in placeOrder is visible; a
+ * single-item cart would hide how checkout cost grows with cart size.
  *
  * Two cart shapes, because they exercise different things:
  *   disjoint   - every buyer's 5 products are unique to that buyer, so concurrent
@@ -49,10 +47,6 @@ function describeFailures(results: OrderOutcome[]): Record<string, number> {
 
 async function main(): Promise<void> {
   const label = process.argv[2] ?? 'run';
-
-  // Both arms must see the same Redis keyspace: placeOrder calls deleteKeysByPattern,
-  // whose SCAN cost scales with total key count, not just matching keys.
-  await redis.flushall();
 
   // Enough products that every buyer in the latency arms gets a private set of 5.
   const needed = (WARMUP + SAMPLES * 2) * ITEMS_PER_CART;
@@ -127,7 +121,7 @@ async function main(): Promise<void> {
   );
 
   writeFileSync(
-    `${process.env.BENCH_OUT ?? '.'}/checkout-${label}.json`,
+    `${process.env.BENCH_OUT ?? 'scripts/bench/results'}/checkout-${label}.json`,
     JSON.stringify(
       {
         label,

@@ -102,8 +102,8 @@ Exactly 3 successes (matching `totalStock`), `availableStock` at exactly `0`, an
 ## Expected output for a passing full run
 
 ```
-Test Suites: 7 passed, 7 total
-Tests:       33 passed, 33 total
+Test Suites: 10 passed, 10 total
+Tests:       54 passed, 54 total
 Snapshots:   0 total
 Time:        ~12-25s (varies with whether Kafka is reachable)
 Ran all test suites.

@@ -1,6 +1,6 @@
 import { Request, Response, NextFunction } from 'express';
 import { productsService } from './products.service';
-import { AppError } from '../../utils/AppError';
+import { requireUser } from '../../utils/requireUser';
 import { ListProductsQuery, CreateProductBody, UpdateProductBody } from './products.validation';
 
 export class ProductsController {
@@ -25,11 +25,9 @@ export class ProductsController {
 
   async create(req: Request, res: Response, next: NextFunction): Promise<void> {
     try {
-      if (!req.user) {
-        throw new AppError(401, 'Missing access token');
-      }
+      const user = requireUser(req);
       const body = req.body as CreateProductBody;
-      const product = await productsService.createProduct(req.user.userId, body);
+      const product = await productsService.createProduct(user.userId, body);
       res.status(201).json({ product });
     } catch (error) {
       next(error);
@@ -38,11 +36,9 @@ export class ProductsController {
 
   async update(req: Request, res: Response, next: NextFunction): Promise<void> {
     try {
-      if (!req.user) {
-        throw new AppError(401, 'Missing access token');
-      }
+      const user = requireUser(req);
       const body = req.body as UpdateProductBody;
-      const product = await productsService.updateProduct(req.params.id, req.user.userId, body);
+      const product = await productsService.updateProduct(req.params.id, user.userId, body);
       res.status(200).json({ product });
     } catch (error) {
       next(error);
@@ -51,10 +47,8 @@ export class ProductsController {
 
   async remove(req: Request, res: Response, next: NextFunction): Promise<void> {
     try {
-      if (!req.user) {
-        throw new AppError(401, 'Missing access token');
-      }
-      await productsService.deleteProduct(req.params.id, req.user.userId);
+      const user = requireUser(req);
+      await productsService.deleteProduct(req.params.id, user.userId);
       res.status(204).send();
     } catch (error) {
       next(error);

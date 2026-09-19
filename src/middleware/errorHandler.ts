@@ -15,7 +15,13 @@ export function errorHandler(
 ): void {
   const statusCode = err.statusCode ?? 500;
 
-  logger.error(err.message, { stack: err.stack, path: req.originalUrl, method: req.method });
+  // A 4xx is the client's mistake and expected in normal operation (wrong password,
+  // insufficient stock); only a 5xx means something is broken and needs its stack.
+  if (statusCode >= 500) {
+    logger.error(err.message, { stack: err.stack, path: req.originalUrl, method: req.method });
+  } else {
+    logger.warn(`${statusCode} ${err.message}`, { path: req.originalUrl, method: req.method });
+  }
 
   res.status(statusCode).json({
     message: statusCode === 500 && env.isProduction ? 'Internal server error' : err.message,

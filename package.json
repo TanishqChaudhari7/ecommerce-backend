@@ -15,7 +15,8 @@
     "seed:fresh": "ts-node scripts/seed-fresh.ts",
     "test": "jest",
     "test:integration": "jest tests/integration",
-    "test:concurrency": "ts-node scripts/test-concurrency.ts"
+    "test:concurrency": "ts-node scripts/test-concurrency.ts",
+    "bench": "bash scripts/bench/run-all.sh"
   },
   "dependencies": {
     "bcrypt": "^6.0.0",

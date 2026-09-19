@@ -1,6 +1,7 @@
 import request from 'supertest';
 import { app } from '../../src/app';
 import { pool } from '../../src/config/db';
+import { redis } from '../../src/config/redis';
 import {
   getSellerToken,
   getCustomerToken,
@@ -245,5 +246,48 @@ describe('Orders API', () => {
 
     expect(response.status).toBe(400);
     expect(await getReservedStock(keptProductId)).toBe(0);
+  });
+
+  it('seeded open orders can be cancelled and delivered', async () => {
+    const customerToken = await getCustomerToken();
+    const adminToken = await getAdminToken();
+    // seeds/seed.ts: order 1 is pending, order 3 is shipped.
+    const pendingOrderId = '00000007-0000-4000-8000-000000000001';
+    const shippedOrderId = '00000007-0000-4000-8000-000000000003';
+
+    const cancelled = await request(app)
+      .put(`/api/v1/orders/${pendingOrderId}/cancel`)
+      .set('Authorization', `Bearer ${customerToken}`);
+    expect(cancelled.status).toBe(200);
+
+    const delivered = await request(app)
+      .put(`/api/v1/orders/${shippedOrderId}/status`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({ status: 'delivered' });
+    expect(delivered.status).toBe(200);
+  });
+
+  it('a committed order is still a 201 when cache invalidation fails', async () => {
+    const sellerToken = await getSellerToken();
+    const { userId, token } = await createDisposableCustomerToken();
+    const productId = await createProductWithStock(sellerToken, 10);
+
+    await request(app)
+      .post('/api/v1/cart/items')
+      .set('Authorization', `Bearer ${token}`)
+      .send({ productId, quantity: 1 });
+
+    const del = jest.spyOn(redis, 'del').mockRejectedValueOnce(new Error('Redis unavailable'));
+    try {
+      const response = await request(app)
+        .post('/api/v1/orders')
+        .set('Authorization', `Bearer ${token}`);
+      expect(response.status).toBe(201);
+    } finally {
+      del.mockRestore();
+    }
+
+    const orders = await pool.query('SELECT id FROM orders WHERE user_id = $1', [userId]);
+    expect(orders.rows).toHaveLength(1);
   });
 });

@@ -1,19 +1,17 @@
 import { Request, Response, NextFunction } from 'express';
 import { inventoryService } from './inventory.service';
-import { AppError } from '../../utils/AppError';
+import { requireUser } from '../../utils/requireUser';
 import { UpdateInventoryBody } from './inventory.validation';
 
 export class InventoryController {
   async updateStock(req: Request, res: Response, next: NextFunction): Promise<void> {
     try {
-      if (!req.user) {
-        throw new AppError(401, 'Missing access token');
-      }
+      const user = requireUser(req);
       const { totalStock } = req.body as UpdateInventoryBody;
       const inventory = await inventoryService.updateStock(
         req.params.productId,
-        req.user.userId,
-        req.user.role,
+        user.userId,
+        user.role,
         totalStock,
       );
       res.status(200).json({ inventory });
@@ -24,10 +22,8 @@ export class InventoryController {
 
   async lowStock(req: Request, res: Response, next: NextFunction): Promise<void> {
     try {
-      if (!req.user) {
-        throw new AppError(401, 'Missing access token');
-      }
-      const products = await inventoryService.getLowStock(req.user.userId, req.user.role);
+      const user = requireUser(req);
+      const products = await inventoryService.getLowStock(user.userId, user.role);
       res.status(200).json({ products });
     } catch (error) {
       next(error);

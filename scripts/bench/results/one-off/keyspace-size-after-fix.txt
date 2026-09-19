@@ -1,0 +1,17 @@
+One-off: the same experiment as keyspace-size-before-fix.txt, after search invalidation
+changed from SCAN + DEL of search:* to INCR of a version counter. throughput.ts with the
+normal dev Redis keyspace against the same keyspace plus 50,000 unrelated keys. Runs
+alternate. In each arm, the first line is the spread arm and the second the one-product arm.
+
+== base, 20 keys in Redis
+throughput: 177.5 orders/s -> 1481.2 orders/s (734.5%, 8.35x)
+throughput: 419.4 orders/s -> 1184.1 orders/s (182.4%, 2.82x)
+== padded, 50021 keys in Redis
+throughput: 207.5 orders/s -> 1775.5 orders/s (755.8%, 8.56x)
+throughput: 371.1 orders/s -> 1045.7 orders/s (181.8%, 2.82x)
+== base, 21 keys in Redis
+throughput: 183.5 orders/s -> 1671.2 orders/s (810.7%, 9.11x)
+throughput: 402.8 orders/s -> 1173.5 orders/s (191.3%, 2.91x)
+== padded, 50021 keys in Redis
+throughput: 215.5 orders/s -> 2107.1 orders/s (877.7%, 9.78x)
+throughput: 481.4 orders/s -> 1187.7 orders/s (146.7%, 2.47x)

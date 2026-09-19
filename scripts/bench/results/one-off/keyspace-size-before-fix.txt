@@ -1,0 +1,17 @@
+One-off, before the fix: throughput.ts with the normal dev Redis keyspace against the same keyspace plus
+50,000 unrelated keys (benchpad:*). Every checkout invalidates search:* with a SCAN over the
+whole keyspace. Runs alternate. In each arm, the first throughput line is the spread arm and
+the second the one-product arm (1 in flight -> 32 in flight).
+
+== base, 19 keys in Redis
+throughput: 204.2 orders/s -> 1919.9 orders/s (840.1%, 9.40x)
+throughput: 466.0 orders/s -> 1420.9 orders/s (204.9%, 3.05x)
+== padded, 50019 keys in Redis
+throughput: 50.3 orders/s -> 349.4 orders/s (594.0%, 6.94x)
+throughput: 51.5 orders/s -> 345.2 orders/s (570.1%, 6.70x)
+== base, 19 keys in Redis
+throughput: 228.3 orders/s -> 2162.4 orders/s (847.0%, 9.47x)
+throughput: 459.8 orders/s -> 1347.1 orders/s (193.0%, 2.93x)
+== padded, 50019 keys in Redis
+throughput: 51.6 orders/s -> 346.3 orders/s (570.9%, 6.71x)
+throughput: 51.5 orders/s -> 345.7 orders/s (570.8%, 6.71x)

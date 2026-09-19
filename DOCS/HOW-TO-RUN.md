@@ -60,6 +60,7 @@ Once the server is running, confirm it's healthy:
 | `npm test` | Runs the full Jest suite (unit + integration tests) |
 | `npm run test:integration` | Runs only `tests/integration/*.test.ts` |
 | `npm run test:concurrency` | Runs the standalone concurrency CLI script against a **running** server (see `DOCS/TESTING-GUIDE.md`) |
+| `npm run bench` | Builds, starts a production server, runs every benchmark and writes `scripts/bench/results/` (port 3000 must be free; see `DOCS/ARCHITECTURE.md` §14) |
 
 ## End-to-end curl walkthrough
 

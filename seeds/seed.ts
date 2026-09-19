@@ -263,15 +263,26 @@ async function seedProducts(): Promise<SeededProduct[]> {
   return products.map((product) => ({ id: product.id, price: product.price }));
 }
 
+// Seeded order i buys one unit of product i, in this status.
+const ORDER_STATUSES = ['pending', 'confirmed', 'shipped', 'delivered', 'cancelled'] as const;
+const OPEN_STATUSES: ReadonlySet<string> = new Set(['pending', 'confirmed', 'shipped']);
+const PAID_STATUSES: ReadonlySet<string> = new Set(['confirmed', 'shipped', 'delivered']);
+const SEED_ORDER_QUANTITY = 1;
+
 async function seedInventory(products: SeededProduct[]): Promise<void> {
   for (const [index, product] of products.entries()) {
     const totalStock = 10 + ((index * 13) % 91);
+    // An open order holds its units as reserved stock until it is delivered or
+    // cancelled, exactly as placeOrder would have left it. Without this, cancelling or
+    // delivering a seeded order would drive reserved_stock negative.
+    const status = ORDER_STATUSES[index];
+    const reservedStock = status && OPEN_STATUSES.has(status) ? SEED_ORDER_QUANTITY : 0;
 
     await pool.query(
-      `INSERT INTO inventory (id, product_id, total_stock, low_stock_threshold)
-       VALUES ($1, $2, $3, $4)
+      `INSERT INTO inventory (id, product_id, total_stock, reserved_stock, low_stock_threshold)
+       VALUES ($1, $2, $3, $4, $5)
        ON CONFLICT (product_id) DO NOTHING`,
-      [seedUuid(4, index + 1), product.id, totalStock, 10],
+      [seedUuid(4, index + 1), product.id, totalStock, reservedStock, 10],
     );
   }
 }
@@ -304,13 +315,10 @@ async function seedCart(products: SeededProduct[]): Promise<void> {
 
 async function seedOrders(products: SeededProduct[]): Promise<void> {
   const customerId = USERS[2].id;
-  const statuses = ['pending', 'confirmed', 'shipped', 'delivered', 'cancelled'] as const;
-  const paidStatuses: ReadonlySet<string> = new Set(['confirmed', 'shipped', 'delivered']);
-
-  for (const [index, status] of statuses.entries()) {
+  for (const [index, status] of ORDER_STATUSES.entries()) {
     const orderId = seedUuid(7, index + 1);
     const product = products[index];
-    const quantity = 1;
+    const quantity = SEED_ORDER_QUANTITY;
     const totalAmount = product.price * quantity;
 
     await pool.query(
@@ -327,7 +335,7 @@ async function seedOrders(products: SeededProduct[]): Promise<void> {
       [seedUuid(8, index + 1), orderId, product.id, quantity, product.price],
     );
 
-    if (paidStatuses.has(status)) {
+    if (PAID_STATUSES.has(status)) {
       await pool.query(
         `INSERT INTO payments (id, order_id, user_id, amount, status, payment_key)
          VALUES ($1, $2, $3, $4, 'completed', $5)

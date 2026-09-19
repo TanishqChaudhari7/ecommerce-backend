@@ -1,0 +1,10 @@
+
+=== Metric C: checkout latency [run] (cart=5 items) ===
+sequential                         n= 250  mean=    6.25ms  p50=    5.84ms  p95=   10.96ms  p99=   13.60ms
+concurrent (32 in flight)          n= 250  mean=   17.59ms  p50=   16.16ms  p95=   31.59ms  p99=   34.93ms
+concurrent failures: {}
+
+-- deadlock probe: 200 overlapping carts, 32 in flight --
+succeeded: 200/200
+failures:  {}
+saved checkout-run.json

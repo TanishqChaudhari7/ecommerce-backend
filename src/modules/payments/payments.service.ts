@@ -1,7 +1,8 @@
 import { pool } from '../../config/db';
-import { redis, deleteKeysByPattern } from '../../config/redis';
+import { invalidateProductCaches } from '../../config/redis';
 import { publishEvent, KAFKA_TOPICS } from '../../config/kafka';
 import { AppError } from '../../utils/AppError';
+import { isUniqueViolation } from '../../utils/pgErrors';
 import { adjustOrderStock } from '../inventory/inventory.stock';
 import { PaymentStatus, PublicPayment } from './payments.types';
 
@@ -13,15 +14,6 @@ interface PaymentRow {
   status: PaymentStatus;
   payment_key: string;
   created_at: Date;
-}
-
-function isUniqueViolation(error: unknown): boolean {
-  return (
-    typeof error === 'object' &&
-    error !== null &&
-    'code' in error &&
-    (error as { code?: string }).code === '23505'
-  );
 }
 
 function toPublicPayment(row: PaymentRow): PublicPayment {
@@ -219,10 +211,7 @@ export class PaymentsService {
       client.release();
     }
 
-    for (const productId of affectedProductIds) {
-      await redis.del(`product:${productId}`);
-    }
-    await deleteKeysByPattern('search:*');
+    await invalidateProductCaches(affectedProductIds);
 
     return toPublicPayment(updatedPayment);
   }

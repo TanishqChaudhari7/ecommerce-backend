@@ -1,6 +1,6 @@
 import { Request, Response, NextFunction } from 'express';
 import { authService } from './auth.service';
-import { AppError } from '../../utils/AppError';
+import { requireUser } from '../../utils/requireUser';
 import { RegisterBody, LoginBody, RefreshBody, LogoutBody } from './auth.validation';
 
 export class AuthController {
@@ -46,10 +46,7 @@ export class AuthController {
 
   async me(req: Request, res: Response, next: NextFunction): Promise<void> {
     try {
-      if (!req.user) {
-        throw new AppError(401, 'Missing access token');
-      }
-      const user = await authService.getMe(req.user.userId);
+      const user = await authService.getMe(requireUser(req).userId);
       res.status(200).json({ user });
     } catch (error) {
       next(error);

@@ -1,6 +1,6 @@
 import crypto from 'crypto';
 import { pool } from '../../config/db';
-import { redis } from '../../config/redis';
+import { redis, getSearchCacheVersion } from '../../config/redis';
 import { PRODUCT_SELECT, toPublicProduct } from '../products/products.query';
 import { ProductRow } from '../products/products.types';
 import { SearchQuery } from './search.validation';
@@ -14,10 +14,10 @@ const SORT_COLUMNS: Record<SearchQuery['sortBy'], string> = {
   created_at: 'p.created_at',
 };
 
-function buildCacheKey(query: SearchQuery): string {
+function buildCacheKey(query: SearchQuery, version: string): string {
   const canonical = JSON.stringify(query, Object.keys(query).sort());
   const hash = crypto.createHash('md5').update(canonical).digest('hex');
-  return `search:${hash}`;
+  return `search:v${version}:${hash}`;
 }
 
 function buildWhereClause(query: SearchQuery): { whereClause: string; params: unknown[] } {
@@ -50,7 +50,9 @@ function buildWhereClause(query: SearchQuery): { whereClause: string; params: un
 
 export class SearchService {
   async search(query: SearchQuery): Promise<SearchResult> {
-    const cacheKey = buildCacheKey(query);
+    // Read the version before querying Postgres: if a write bumps it meanwhile, this
+    // page is stored under the old version and never served.
+    const cacheKey = buildCacheKey(query, await getSearchCacheVersion());
     const cached = await redis.get(cacheKey);
     if (cached) {
       cacheHitsTotal.inc({ key_pattern: 'search' });

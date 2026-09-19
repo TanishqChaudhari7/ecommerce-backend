@@ -1,6 +1,7 @@
 import { randomUUID } from 'crypto';
 import jwt, { SignOptions } from 'jsonwebtoken';
 import { pool } from '../../src/config/db';
+import { invalidateProductCaches } from '../../src/config/redis';
 import { env } from '../../config/env';
 
 export const BASE_URL = process.env.API_BASE_URL ?? 'http://localhost:3000';
@@ -155,6 +156,14 @@ export async function inventoryOf(
  * with ON DELETE RESTRICT, so they have to go first.
  */
 export async function cleanupBenchData(): Promise<void> {
+  // Drop the bench products' cache entries too, so one benchmark's thousands of cached
+  // products do not linger in Redis while the next one runs.
+  const benchProducts = await pool.query<{ id: string }>(
+    'SELECT id FROM products WHERE seller_id = $1',
+    [BENCH_SELLER_ID],
+  );
+  await invalidateProductCaches(benchProducts.rows.map((row) => row.id));
+
   await pool.query(
     `DELETE FROM orders WHERE user_id IN (SELECT id FROM users WHERE email LIKE 'bench-%@bench.local')`,
   );

@@ -5,18 +5,10 @@ import ms from 'ms';
 import { pool } from '../../config/db';
 import { env } from '../../../config/env';
 import { AppError } from '../../utils/AppError';
+import { isUniqueViolation } from '../../utils/pgErrors';
 import { AccessTokenPayload, PublicUser, RegisterInput, TokenPair, UserRow } from './auth.types';
 
 const BCRYPT_ROUNDS = 12;
-
-function isUniqueViolation(error: unknown): boolean {
-  return (
-    typeof error === 'object' &&
-    error !== null &&
-    'code' in error &&
-    (error as { code?: string }).code === '23505'
-  );
-}
 
 function toPublicUser(row: UserRow): PublicUser {
   return {
